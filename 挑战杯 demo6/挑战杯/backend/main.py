@@ -34,6 +34,16 @@ def _sanitize_json(obj):
     return obj
 
 
+def _resolve_stage_plate(part: str, part_plate_map: dict) -> str:
+    """工序条目的钢板名：普通零件查映射，整板大件标签直接还原。"""
+    if part in part_plate_map:
+        return str(part_plate_map[part])
+    suffix = "切割后的大件"
+    if part.endswith(suffix):
+        return part[: -len(suffix)]
+    return ""
+
+
 # ── P0-2/P0-3 FIX: Path traversal guard ──
 def _safe_result_path(run_id: str, filename: str | None = None) -> Path:
     """Resolve a path inside RESULT_DIR, rejecting traversal attempts."""
@@ -45,12 +55,10 @@ def _safe_result_path(run_id: str, filename: str | None = None) -> Path:
         raise HTTPException(403, "非法运行ID")
 
     if filename is not None:
-        safe_fn = os.path.basename(filename) or "_"
-        if safe_fn != filename:
+        rel = Path(filename.replace("\\", "/"))
+        if rel.is_absolute() or ".." in rel.parts or len(rel.parts) > 2:
             raise HTTPException(403, "非法文件名")
-        if safe_fn in (".", ".."):
-            raise HTTPException(403, "非法文件名")
-        resolved = (RESULT_DIR / safe_id / safe_fn).resolve()
+        resolved = (RESULT_DIR / safe_id / rel).resolve()
     else:
         resolved = (RESULT_DIR / safe_id).resolve()
 
@@ -262,9 +270,19 @@ def _optimizer_display_name(cfg) -> str:
     return f"SA+Tabu + {_objective_display_name(cfg)}"
 
 
-def _run_model(plates: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, out_dir: Path, checks: dict, speed_table_path: str | None = None):
+def _run_model(
+    plates: pd.DataFrame,
+    parts: pd.DataFrame,
+    cfg: ModelConfig,
+    out_dir: Path,
+    checks: dict,
+    speed_table_path: str | None = None,
+    eval_track: str = "capacity",
+    progress_tag: str | None = None,
+):
     """运行完整建模管线，将结果写入 out_dir 并返回结构化数据。"""
     out_dir.mkdir(parents=True, exist_ok=True)
+    cfg.eval_track = eval_track
     # 加载附件3工艺参数（若提供）
     pp = None
     speed_table = None
@@ -278,7 +296,7 @@ def _run_model(plates: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, out_
     features = plate_features(plates, parts, cfg, speed_table)
 
     # ── 进度回调 ──
-    run_tag = out_dir.name  # run_id
+    run_tag = progress_tag or out_dir.name  # run_id
     def _progress_cb(iteration: int, max_iter: int, current_obj: float, best_obj: float, temp: float):
         with _progress_lock:
             _optimization_progress[run_tag] = {
@@ -298,6 +316,7 @@ def _run_model(plates: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, out_
         cfg.local_search_iterations >= 400
         and method == "sa_tabu"
         and objective_type == "linear"
+        and eval_track == "capacity"
     )
     if method == "ga_lns":
         opt_result = run_ga_lns_optimization(
@@ -527,7 +546,7 @@ def _run_model(plates: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, out_
             "resource": str(r.iloc[2]),
             "start": round(float(r.iloc[3]) / 60, 4),
             "end": round(float(r.iloc[4]) / 60, 4),
-            "plate": part_plate_map.get(str(r.iloc[0]), ""),
+            "plate": _resolve_stage_plate(str(r.iloc[0]), part_plate_map),
         })
 
     return {
@@ -750,7 +769,29 @@ async def run_model(payload: dict):
 
     try:
         plates, parts, checks = load_and_validate(input_path)
-        result = _run_model(plates, parts, cfg, out_dir, checks, speed_table_path)
+        # P4-3：双轨并行——产能优先(当前) + 兼顾三指标(原评价)，尽可能占满 CPU
+        from concurrent.futures import ThreadPoolExecutor
+        _prev_env = os.environ.get("OPTIMIZER_PARALLEL")
+        os.environ["OPTIMIZER_PARALLEL"] = str(max(2, (os.cpu_count() or 4) // 2))
+
+        def _run_one(track: str, sub: str | None):
+            target = out_dir if sub is None else out_dir / sub
+            return _run_model(
+                plates, parts, cfg, target, checks, speed_table_path,
+                eval_track=track, progress_tag=run_id,
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as _dual_exec:
+                _fut_cap = _dual_exec.submit(_run_one, "capacity", None)
+                _fut_bal = _dual_exec.submit(_run_one, "balanced", "balanced")
+                result = _fut_cap.result()
+                balanced_result = _fut_bal.result()
+        finally:
+            if _prev_env is None:
+                os.environ.pop("OPTIMIZER_PARALLEL", None)
+            else:
+                os.environ["OPTIMIZER_PARALLEL"] = _prev_env
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, f"模型运行失败: {e}")
@@ -770,16 +811,26 @@ async def run_model(payload: dict):
     }) or h)
 
     result["run_id"] = run_id
-    result["files"] = {
-        "schedule_csv": f"{run_id}/optimized_plate_schedule.csv",
-        "completion_csv": f"{run_id}/part_completion.csv",
-        "kit_csv": f"{run_id}/kit_groups.csv",
-        "stages_csv": f"{run_id}/process_stages.csv",
-        "comparison_csv": f"{run_id}/comparison.csv",
-        "gantt_png": f"{run_id}/cutting_gantt.png",
-        "kit_png": f"{run_id}/kit_span.png",
-        "util_png": f"{run_id}/resource_utilisation.png",
+    _file_map = {
+        "schedule_csv": "optimized_plate_schedule.csv",
+        "completion_csv": "part_completion.csv",
+        "kit_csv": "kit_groups.csv",
+        "stages_csv": "process_stages.csv",
+        "comparison_csv": "comparison.csv",
+        "gantt_png": "cutting_gantt.png",
+        "kit_png": "kit_span.png",
+        "util_png": "resource_utilisation.png",
     }
+    result["files"] = {k: f"{run_id}/{v}" for k, v in _file_map.items()}
+    balanced_result["files"] = {k: f"{run_id}/balanced/{v}" for k, v in _file_map.items()}
+    result["reportMode"] = "capacity"
+    result["algorithmName"] = f"{result.get('algorithmName', '优化')}（产能优先/重工时）"
+    balanced_result["algorithmName"] = f"{balanced_result.get('algorithmName', '优化')}（兼顾三指标/原评价）"
+    result["reports"] = {
+        "capacity": {**result, "run_id": run_id},
+        "balanced": {**balanced_result, "run_id": run_id},
+    }
+    # 顶层字段保持 capacity，前端切换报告时用 reports[mode] 覆盖顶层
     return result
 
 
@@ -797,12 +848,16 @@ async def get_run_progress(run_id: str):
 
 
 @app.get("/api/report/{run_id}")
-async def download_report(run_id: str):
+async def download_report(run_id: str, mode: str = "capacity"):
     """生成并下载 Word 建模报告。"""
     # P0-3 FIX: path traversal guard
     run_dir = _safe_result_path(run_id)
     if not run_dir.exists():
         raise HTTPException(404, "运行记录不存在")
+    if mode == "balanced":
+        run_dir = run_dir / "balanced"
+        if not run_dir.exists():
+            raise HTTPException(404, "平衡版结果不存在")
 
     docx_path = run_dir / "report.docx"
     if not docx_path.exists():
@@ -1001,7 +1056,7 @@ async def get_run_detail(run_id: str):
             "resource": str(r.iloc[2]),
             "start": round(float(r.iloc[3]) / 60, 4),
             "end": round(float(r.iloc[4]) / 60, 4),
-            "plate": part_plate_map.get(str(r.iloc[0]), ""),
+            "plate": _resolve_stage_plate(str(r.iloc[0]), part_plate_map),
         })
 
     # 读取缓存时序数据（新运行有，旧历史记录可能缺失）
@@ -1302,6 +1357,14 @@ async def reschedule(payload: dict):
 
         # 构建 stagesData（含切割+下游工序）
         stages_data = []
+        part_plate_map = {}
+        try:
+            part_plate_map = dict(zip(
+                parts["零件名"].astype(str),
+                parts["套料图名"].astype(str),
+            ))
+        except Exception:
+            pass
         for _, r in new_schedule.iterrows():
             stages_data.append({
                 "part": str(r["套料图名"]),
@@ -1317,6 +1380,7 @@ async def reschedule(payload: dict):
                 "resource": str(r.iloc[2]),
                 "start": round(float(r.iloc[3]) / 60, 4),
                 "end": round(float(r.iloc[4]) / 60, 4),
+                "plate": _resolve_stage_plate(str(r.iloc[0]), part_plate_map),
             })
 
         # 构建 utilizationData

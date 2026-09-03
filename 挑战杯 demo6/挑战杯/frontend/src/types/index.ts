@@ -131,6 +131,7 @@ export interface BufferCapacityConfig {
 
 export interface RunResponse {
   run_id: string;
+  reportMode?: 'capacity' | 'balanced';
   algorithmName?: string;
   metrics: {
     fifo: MetricsMap;
@@ -154,6 +155,18 @@ export interface RunResponse {
     gantt_png: string;
     kit_png: string;
     util_png: string;
+  };
+}
+
+export type RunReportPayload = Omit<
+  RunResponse,
+  'reportMode' | 'reports' | 'run_id'
+> & { run_id?: string };
+
+export interface DualRunResponse extends RunResponse {
+  reports?: {
+    capacity: RunReportPayload;
+    balanced: RunReportPayload;
   };
 }
 

@@ -29,6 +29,8 @@ from steel_schedule_model import (  # noqa: E402
     build_crane_aware_orders,
     unified_capacity_objective,
     select_best_by_capacity,
+    legacy_balanced_objective,
+    select_best_by_track,
 )
 
 
@@ -68,7 +70,16 @@ def _ga_eval_worker(order: list[str]) -> tuple[list[str], dict, float]:
     """在子进程中评估一个钢板排列，返回 (order, metrics, objective)。"""
     st = _GA_PARALLEL_STATE
     _, met, _ = st["builder"].schedule_from_order(order)
-    # P4-1：统一产能优先目标，二次/线性只影响辅助指标
+    if getattr(st["cfg"], "eval_track", "capacity") == "balanced":
+        obj = legacy_balanced_objective(
+            met,
+            st["cfg"],
+            objective_type=st["objective_type"],
+            fifo_cmax=st.get("fifo_cmax"),
+            fifo_kit=st.get("fifo_kit"),
+            fifo_load=st.get("fifo_load"),
+        )
+        return order, met, obj
     fifo = {
         "加权平均齐套跨度(h)": st["fifo_kit"],
         "切割负载差(h)": st["fifo_load"],
@@ -139,7 +150,15 @@ class GeneticLNSOptimizer(SATabuOptimizer):
 
     # ── 评估 ──────────────────────────────────────────────
     def _fitness(self, metrics: dict) -> float:
-        # P4-1：统一产能优先目标，二次/线性只影响辅助指标
+        if getattr(self.cfg, "eval_track", "capacity") == "balanced":
+            return legacy_balanced_objective(
+                metrics,
+                self.cfg,
+                objective_type=self.objective_type,
+                fifo_cmax=getattr(self, "fifo_cmax", None),
+                fifo_kit=getattr(self, "fifo_kit_span", None),
+                fifo_load=getattr(self, "fifo_load_diff", None),
+            )
         fifo = {
             "加权平均齐套跨度(h)": getattr(self, "fifo_kit_span", None),
             "切割负载差(h)": getattr(self, "fifo_load_diff", None),
@@ -495,8 +514,13 @@ class GeneticLNSOptimizer(SATabuOptimizer):
         ]
         if not candidates:
             return best_order, best_met
-        _name, final_order, final_met = select_best_by_capacity(
-            candidates, self.cfg, self.objective_type
+        _name, final_order, final_met = select_best_by_track(
+            candidates,
+            self.cfg,
+            objective_type=self.objective_type,
+            fifo_cmax=getattr(self, "fifo_cmax", None),
+            fifo_kit=getattr(self, "fifo_kit_span", None),
+            fifo_load=getattr(self, "fifo_load_diff", None),
         )
         return final_order, final_met
 

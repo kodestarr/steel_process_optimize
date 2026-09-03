@@ -56,8 +56,8 @@ export async function renameRun(
   await api.put(`/history/${runId}/name`, { name });
 }
 
-export function reportUrl(runId: string): string {
-  return `/api/report/${runId}`;
+export function reportUrl(runId: string, mode?: string): string {
+  return `/api/report/${runId}${mode ? `?mode=${mode}` : ''}`;
 }
 
 export function downloadUrl(runId: string, filename: string): string {

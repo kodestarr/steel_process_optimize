@@ -67,6 +67,7 @@ interface CuttingRow {
   start: number;
   end: number;
   name: string;
+  displayName?: string;
   section: string;
   duration: number;
   table?: number;
@@ -138,6 +139,15 @@ function normalizeBinLabel(name: string): string {
     .replace(/_坡口$/, '')
     .replace(/_合盘$/, '')
     .replace(/_坡口$/, '');
+}
+
+const LARGE_STAGE_WORDS = ['自由边打磨', '人工坡口', '天车吊运', '天车空驶'];
+
+function getStageDisplayName(name: string, plate?: string, section?: string): string {
+  if (plate && section && LARGE_STAGE_WORDS.some((w) => section.includes(w))) {
+    return `${plate}切割后的大件`;
+  }
+  return name;
 }
 
 function getMaterialKeys(it: { name: string; section: string; plate?: string; highlightKeys?: string[] }): string[] {
@@ -304,6 +314,7 @@ const GanttChart: React.FC<Props> = ({ data, makespanHours, stages }) => {
           start: s.start,
           end: s.end,
           name: s.part,
+          displayName: getStageDisplayName(s.part, s.plate, s.stage),
           section: s.stage,
           duration: s.end - s.start,
           plate: s.plate,
@@ -477,7 +488,7 @@ const GanttChart: React.FC<Props> = ({ data, makespanHours, stages }) => {
                 (isDual ? (it.table ?? 0) === i : (it.instance ?? 0) === i)
             );
             const labelText = active
-              ? `${active.name}${active.section ? ` (${active.section})` : ''} · 工时 ${formatDuration(active.duration)}`
+              ? `${active.displayName ?? active.name}${active.section ? ` (${active.section})` : ''} · 工时 ${formatDuration(active.duration)}`
               : '空闲';
             const labelWidth = estimateTextWidth(labelText, 10);
             const labelLeft = px + 10 + labelWidth > gridRect.x + gridRect.width

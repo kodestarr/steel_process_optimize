@@ -33,6 +33,7 @@ from steel_schedule_model import (
     build_joint_schedule, build_crane_aware_orders,
     CranePool, _reserve_raw_material_crane,
     unified_capacity_objective, select_best_by_capacity,
+    legacy_balanced_objective, select_best_by_track,
 )
 
 
@@ -239,12 +240,21 @@ class SATabuOptimizer:
         J = Cmax/LB + eps * Secondary
         Secondary 按 cfg.objective_type 选择线性或二次，且封顶归一化。
         """
+        objective_type = getattr(self.cfg, "objective_type", "linear")
+        if getattr(self.cfg, "eval_track", "capacity") == "balanced":
+            return legacy_balanced_objective(
+                metrics,
+                self.cfg,
+                objective_type=objective_type,
+                fifo_cmax=getattr(self, "fifo_cmax", None),
+                fifo_kit=getattr(self, "fifo_kit_span", None),
+                fifo_load=getattr(self, "fifo_load_diff", None),
+            )
         fifo = {
             "加权平均齐套跨度(h)": getattr(self, "fifo_kit_span", None),
             "切割负载差(h)": getattr(self, "fifo_load_diff", None),
             "总等待时间(h)": getattr(self, "fifo_waiting", None),
         }
-        objective_type = getattr(self.cfg, "objective_type", "linear")
         return unified_capacity_objective(metrics, self.cfg, fifo=fifo, objective_type=objective_type)
 
     # ── Neighborhood operators ─────────────────────────────
@@ -427,8 +437,13 @@ class SATabuOptimizer:
             (f"archive{i}", o, m)
             for i, (o, m) in enumerate(self.pareto_archive)
         ]
-        _name, best_order, best_met = select_best_by_capacity(
-            candidates, self.cfg, getattr(self.cfg, "objective_type", "linear")
+        _name, best_order, best_met = select_best_by_track(
+            candidates,
+            self.cfg,
+            objective_type=getattr(self.cfg, "objective_type", "linear"),
+            fifo_cmax=getattr(self, "fifo_cmax", None),
+            fifo_kit=getattr(self, "fifo_kit_span", None),
+            fifo_load=getattr(self, "fifo_load_diff", None),
         )
         return best_order, best_met
 
@@ -1011,8 +1026,13 @@ def run_multi_strategy_inline(
     # ── 3-tier dual-win selection (Loop 2) ──
     # Tier 1: Cmax ≤ FIFO AND KitSpan ≤ 12.7h → pick lowest KitSpan (ideal dual-win)
     # P4-1：最终选解改为产能优先 + 1%容差内比辅助指标
-    _selected = select_best_by_capacity(
-        all_candidates, cfg, getattr(cfg, "objective_type", "linear")
+    _selected = select_best_by_track(
+        all_candidates,
+        cfg,
+        objective_type=getattr(cfg, "objective_type", "linear"),
+        fifo_cmax=fifo_baseline_cmax,
+        fifo_kit=fifo_baseline_kit,
+        fifo_load=fifo_baseline_load,
     )
     best_name, best_order, best_metrics = _selected
     tier_label = "产能优先(Cmax/LB最小，1%内选辅助最优)"

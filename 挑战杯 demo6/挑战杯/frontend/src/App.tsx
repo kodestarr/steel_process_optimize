@@ -3,6 +3,7 @@ import {
   Tabs,
   Button,
   Space,
+  Segmented,
   Dropdown,
   message,
   Modal,
@@ -45,6 +46,7 @@ const App: React.FC = () => {
   const [upload, setUpload] = useState<UploadResponse | null>(null);
   const [params, setParams] = useState<ModelParams>({ ...DEFAULT_PARAMS });
   const [result, setResult] = useState<RunResponse | null>(null);
+  const [reportMode, setReportMode] = useState<'capacity' | 'balanced'>('capacity');
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadProgress, setLoadProgress] = useState<{ elapsed: number; stage: string } | null>(null);
@@ -112,6 +114,7 @@ const App: React.FC = () => {
       }
       setPrevResult(result);
       setResult(res);
+      setReportMode('capacity');
       setActiveRunId(res.run_id);
       setActiveTab('overview');
       message.success('计算完成！');
@@ -138,8 +141,25 @@ const App: React.FC = () => {
   const handleHistorySelect = useCallback((runId: string, data: RunResponse) => {
     setPrevResult(result);
     setResult(data);
+    setReportMode(data.reportMode === 'balanced' ? 'balanced' : 'capacity');
     setActiveRunId(runId);
     setActiveTab('overview');
+  }, [result]);
+
+  const handleReportModeChange = useCallback((mode: any) => {
+    const reports = (result as any)?.reports;
+    if (!reports || (mode !== 'capacity' && mode !== 'balanced')) return;
+    const payload = reports[mode];
+    if (!payload) return;
+    const rid = result?.run_id ?? '';
+    setResult((prev) => ({
+      ...(prev ?? result),
+      ...payload,
+      run_id: prev?.run_id ?? rid,
+      reportMode: mode,
+      reports: (prev as any)?.reports ?? reports,
+    }));
+    setReportMode(mode);
   }, [result]);
 
   const downloadItems = useMemo(() => {
@@ -163,7 +183,7 @@ const App: React.FC = () => {
     if (!result) return;
     try {
       if (key === 'report') {
-        window.open(reportUrl(result.run_id), '_blank');
+        window.open(reportUrl(result.run_id, result.reportMode), '_blank');
       } else if (key.endsWith('_img')) {
         const imgMap: Record<string, string> = {
           gantt_img: result.files.gantt_png,
@@ -171,7 +191,10 @@ const App: React.FC = () => {
           util_img: result.files.util_png,
         };
         const filename = imgMap[key];
-        if (filename) window.open(downloadUrl(result.run_id, filename.split('/').pop()!), '_blank');
+        if (filename) {
+          const rel = filename.split('/').slice(1).join('/');
+          window.open(downloadUrl(result.run_id, rel), '_blank');
+        }
         else message.warning('找不到对应图片文件');
       } else {
         const fileMap: Record<string, string> = {
@@ -182,7 +205,10 @@ const App: React.FC = () => {
           comparison: result.files.comparison_csv,
         };
         const filename = fileMap[key];
-        if (filename) window.open(downloadUrl(result.run_id, filename.split('/').pop()!), '_blank');
+        if (filename) {
+          const rel = filename.split('/').slice(1).join('/');
+          window.open(downloadUrl(result.run_id, rel), '_blank');
+        }
         else message.warning('找不到对应下载文件');
       }
     } catch (e: any) {
@@ -250,6 +276,16 @@ const App: React.FC = () => {
           )}
         </div>
         <Space>
+          {(result as any)?.reports && (
+            <Segmented
+              value={reportMode}
+              onChange={handleReportModeChange}
+              options={[
+                { label: '重工时（产能优先）', value: 'capacity' },
+                { label: '兼顾三指标（原评价）', value: 'balanced' },
+              ]}
+            />
+          )}
           <Button type="primary" icon={<PlayCircleOutlined />} onClick={handleRun} loading={loading} size="large">
             开始计算
           </Button>

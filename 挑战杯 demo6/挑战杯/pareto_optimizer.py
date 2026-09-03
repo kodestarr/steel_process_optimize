@@ -22,6 +22,8 @@ from steel_schedule_model import (
     build_crane_aware_orders,
     unified_capacity_objective,
     select_best_by_capacity,
+    legacy_balanced_objective,
+    select_best_by_track,
 )
 
 
@@ -38,6 +40,15 @@ def quadratic_objective(
     与线性评价共用同一结构 J = Cmax/LB + eps*Secondary，
     只有 Secondary 的平方项不同。
     """
+    if getattr(cfg, "eval_track", "capacity") == "balanced":
+        return legacy_balanced_objective(
+            metrics,
+            cfg,
+            objective_type="quadratic",
+            fifo_cmax=fifo_cmax,
+            fifo_kit=fifo_kit,
+            fifo_load=fifo_load,
+        )
     fifo = {
         "加权平均齐套跨度(h)": fifo_kit,
         "切割负载差(h)": fifo_load,
@@ -67,8 +78,13 @@ class QuadraticSAOptimizer(SATabuOptimizer):
             (f"archive{i}", o, m)
             for i, (o, m) in enumerate(self.pareto_archive)
         ]
-        _name, best_order, best_met = select_best_by_capacity(
-            candidates, self.cfg, "quadratic"
+        _name, best_order, best_met = select_best_by_track(
+            candidates,
+            self.cfg,
+            objective_type="quadratic",
+            fifo_cmax=getattr(self, "fifo_cmax", None),
+            fifo_kit=getattr(self, "fifo_kit_span", None),
+            fifo_load=getattr(self, "fifo_load_diff", None),
         )
         return best_order, best_met
 
@@ -225,11 +241,20 @@ def run_quadratic_optimization(
             for arch_order, arch_met in result["archive"]:
                 all_candidates.append((f"{name}-archive", arch_order, arch_met))
 
-    # P4-1：最终选解改为产能优先 + 1%容差内比辅助指标
-    best_name, best_order, _best_metrics = select_best_by_capacity(
-        all_candidates, cfg, "quadratic"
+    # P4-1：按 eval_track 选择最终解（产能优先 / 原三指标）
+    best_name, best_order, _best_metrics = select_best_by_track(
+        all_candidates,
+        cfg,
+        objective_type="quadratic",
+        fifo_cmax=fifo_baseline_cmax,
+        fifo_kit=fifo_baseline_kit,
+        fifo_load=fifo_baseline_load,
     )
-    tier_label = "产能优先(Cmax/LB最小，1%内选辅助最优)"
+    tier_label = (
+        "原三指标兼顾(平衡)"
+        if getattr(cfg, "eval_track", "capacity") == "balanced"
+        else "产能优先(Cmax/LB最小，1%内选辅助最优)"
+    )
 
     builder = SATabuOptimizer(features, parts, cfg, pp, seed=cfg.random_seed)
     builder.fifo_cmax = fifo_baseline_cmax

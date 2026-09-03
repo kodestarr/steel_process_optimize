@@ -62,6 +62,7 @@ class ModelConfig:
     random_seed: int = 20260723
     optimizer_method: str = "sa_tabu"  # sa_tabu=SA+Tabu, ga_lns=GA+LNS
     objective_type: str = "linear"     # linear=线性评价, quadratic=二次非线性评价
+    eval_track: str = "capacity"       # capacity=产能优先(当前), balanced=兼顾三指标(原评价)
     ga_population_size: int = 16
     ga_generations: int = 10
     ga_crossover_rate: float = 0.85
@@ -1339,6 +1340,7 @@ def build_joint_schedule(
         plate_small_end = en
         plate_large_release = en
         plate_part_names: list[str] = []
+        large_part_rows: list[dict] = []
         plate_prebooked = False
         plate_parts = plate_parts_map.get(plate_name, pd.DataFrame())
         for _, pr in plate_parts.iterrows():
@@ -1416,70 +1418,103 @@ def build_joint_schedule(
                 part_arrival[pname] = t  # 小件加工完成即可进入码垛/坡口工作站
                 plate_small_end = max(plate_small_end, t)
             else:
-                # 大件：切割完成后先在切割胎架做自由边打磨，再用天车吊运到人工坡口/成品区
-                t = en
-                t = add_stage(
-                    pname,
-                    "自由边打磨",
-                    _large_grind_for(machine),
-                    t,
-                    pr.get("打磨长度_模型(mm)", 0) / lg_speed,
-                )
-                has_bv = pr.get("人工坡口长度(mm)", 0) > 0
-                plate_release = t
-                if not plate_prebooked:
-                    _try_prebook_next_raw(seq, machine, table_idx, t)
-                    plate_prebooked = True
-                if has_bv:
-                    bevel_transfer = getattr(cfg, "crane_bevel_transfer_minutes", 3.0)
-                    c_start, empty_end, loaded_end = crane_pool.reserve_move(
-                        t, "胎架", "坡口区", bevel_transfer, cfg,
+                # 大件：先只在胎架上安排自由边打磨；不需打磨的等待需要打磨的完成。
+                # 整板大件之后由人工天车按目的地成组一次转运（新工艺说明）。
+                grind_dur = float(pr.get("打磨长度_模型(mm)", 0) or 0) / lg_speed
+                has_bv = float(pr.get("人工坡口长度(mm)", 0) or 0) > 0
+                if grind_dur > 1e-9:
+                    t_grind = add_stage(
+                        pname,
+                        "自由边打磨",
+                        _large_grind_for(machine),
+                        en,
+                        grind_dur,
                     )
-                    if empty_end > c_start + 1e-9:
-                        stages.append({"零件名": pname,
-                                        "工序": f"天车空驶（{crane_pool.last_empty_origin}到{crane_pool.last_empty_dest}）",
-                                        "资源": "天车",
-                                        "开始(min)": c_start, "结束(min)": empty_end,
-                                        "时长(min)": empty_end - c_start})
-                    stages.append({"零件名": pname,
-                                    "工序": f"天车吊运（{crane_pool.last_loaded_origin}到{crane_pool.last_loaded_dest}）",
-                                    "资源": "天车",
-                                    "开始(min)": empty_end, "结束(min)": loaded_end,
-                                    "时长(min)": loaded_end - empty_end})
-                    plate_release = loaded_end
-                    t = loaded_end
-                    t = add_stage(pname, "人工坡口", mb_pool, t, pr.get("人工坡口长度(mm)", 0) / mb_speed)
-
-                c_start, empty_end, loaded_end = crane_pool.reserve_move(
-                    t,
-                    "坡口区" if has_bv else "胎架",
-                    "成品区",
-                    large_trans,
-                    cfg,
-                )
-                if empty_end > c_start + 1e-9:
-                    stages.append({"零件名": pname,
-                                    "工序": f"天车空驶（{crane_pool.last_empty_origin}到{crane_pool.last_empty_dest}）",
-                                    "资源": "天车",
-                                    "开始(min)": c_start, "结束(min)": empty_end,
-                                    "时长(min)": empty_end - c_start})
-                stages.append({"零件名": pname,
-                                "工序": f"天车吊运（{crane_pool.last_loaded_origin}到{crane_pool.last_loaded_dest}）",
-                                "资源": "天车",
-                                "开始(min)": empty_end, "结束(min)": loaded_end,
-                                "时长(min)": loaded_end - empty_end})
-                if not has_bv:
-                    plate_release = loaded_end
-                t = loaded_end
-                # 大件由人工行车吊运到成品区（不计入AGV）
-                part_proc_done[pname] = t
-                part_arrival[pname] = t  # 大件加工完成即到成品区
-                plate_large_release = max(plate_large_release, plate_release)
+                else:
+                    t_grind = en
+                if not plate_prebooked:
+                    _try_prebook_next_raw(seq, machine, table_idx, t_grind)
+                    plate_prebooked = True
+                large_part_rows.append({
+                    "pname": pname,
+                    "has_bv": has_bv,
+                    "grind_end": t_grind,
+                    "bevel_dur": (
+                        float(pr.get("人工坡口长度(mm)", 0) or 0) / mb_speed
+                        if has_bv else 0.0
+                    ),
+                })
             part_has_bevel[pname] = has_bv
             part_seg[pname] = str(pr["分段号"])
             part_pri[pname] = int(pr["齐套优先级"])
             part_type[pname] = pr["零件类型"]
             part_plate[pname] = plate_name
+
+        # ── 整板大件成组转运：人工天车一次可转运多个大件 ──
+        for has_bv_group in (False, True):
+            group = [x for x in large_part_rows if bool(x["has_bv"]) == has_bv_group]
+            if not group:
+                continue
+            group_ready = max(x["grind_end"] for x in group)
+            batch_label = f"{plate_name}切割后的大件"
+            if has_bv_group:
+                # 需要人工坡口的大件整批先到坡口区，坡口完成后再整批到成品区
+                c_start, empty_end, loaded_end = crane_pool.reserve_move(
+                    group_ready, "胎架", "坡口区",
+                    getattr(cfg, "crane_bevel_transfer_minutes", 3.0), cfg,
+                )
+                if empty_end > c_start + 1e-9:
+                    stages.append({"零件名": batch_label,
+                                    "工序": f"天车空驶（{crane_pool.last_empty_origin}到{crane_pool.last_empty_dest}）",
+                                    "资源": "天车",
+                                    "开始(min)": c_start, "结束(min)": empty_end,
+                                    "时长(min)": empty_end - c_start})
+                stages.append({"零件名": batch_label,
+                                "工序": f"天车吊运（{crane_pool.last_loaded_origin}到{crane_pool.last_loaded_dest}）",
+                                "资源": "天车",
+                                "开始(min)": empty_end, "结束(min)": loaded_end,
+                                "时长(min)": loaded_end - empty_end})
+                group_release = loaded_end
+                t_bevel = loaded_end
+                for x in sorted(group, key=lambda z: z["pname"]):
+                    t_bevel = add_stage(x["pname"], "人工坡口", mb_pool, t_bevel, x["bevel_dur"])
+                c2_start, empty2_end, loaded2_end = crane_pool.reserve_move(
+                    t_bevel, "坡口区", "成品区", large_trans, cfg,
+                )
+                if empty2_end > c2_start + 1e-9:
+                    stages.append({"零件名": batch_label,
+                                    "工序": f"天车空驶（{crane_pool.last_empty_origin}到{crane_pool.last_empty_dest}）",
+                                    "资源": "天车",
+                                    "开始(min)": c2_start, "结束(min)": empty2_end,
+                                    "时长(min)": empty2_end - c2_start})
+                stages.append({"零件名": batch_label,
+                                "工序": f"天车吊运（{crane_pool.last_loaded_origin}到{crane_pool.last_loaded_dest}）",
+                                "资源": "天车",
+                                "开始(min)": empty2_end, "结束(min)": loaded2_end,
+                                "时长(min)": loaded2_end - empty2_end})
+                final_end = loaded2_end
+            else:
+                # 不需人工坡口的大件整批直接到成品区
+                c_start, empty_end, loaded_end = crane_pool.reserve_move(
+                    group_ready, "胎架", "成品区", large_trans, cfg,
+                )
+                if empty_end > c_start + 1e-9:
+                    stages.append({"零件名": batch_label,
+                                    "工序": f"天车空驶（{crane_pool.last_empty_origin}到{crane_pool.last_empty_dest}）",
+                                    "资源": "天车",
+                                    "开始(min)": c_start, "结束(min)": empty_end,
+                                    "时长(min)": empty_end - c_start})
+                stages.append({"零件名": batch_label,
+                                "工序": f"天车吊运（{crane_pool.last_loaded_origin}到{crane_pool.last_loaded_dest}）",
+                                "资源": "天车",
+                                "开始(min)": empty_end, "结束(min)": loaded_end,
+                                "时长(min)": loaded_end - empty_end})
+                group_release = loaded_end
+                final_end = loaded_end
+            for x in group:
+                part_proc_done[x["pname"]] = final_end
+                part_arrival[x["pname"]] = final_end  # 大件完成即到成品区
+            plate_large_release = max(plate_large_release, group_release)
 
         # 胎架释放 = 该钢板所有下游真实动作完成时刻
         actual_table_end = max(input_table_end, en, plate_small_end, plate_large_release)
@@ -2257,6 +2292,122 @@ def select_best_by_capacity(
         ),
     )
     return best
+
+
+def legacy_balanced_objective(
+    metrics: Dict[str, float],
+    cfg: ModelConfig,
+    objective_type: str | None = None,
+    fifo_cmax: float | None = None,
+    fifo_kit: float | None = None,
+    fifo_load: float | None = None,
+) -> float:
+    """原有“兼顾三个指标”评价函数（参考副本保留版）。
+
+    linear 分支：原 SA 的 satisficing 加权 + Cmax/缓存/胎架软惩罚；
+    quadratic 分支：原 FIFO 相对二次评价 + 胎架软惩罚。
+    """
+    if objective_type is None:
+        objective_type = getattr(cfg, "objective_type", "linear")
+    cmax = float(metrics["总完工时间(h)"])
+    kit_span = float(metrics["加权平均齐套跨度(h)"])
+    load_diff = float(metrics["切割负载差(h)"])
+
+    if objective_type == "quadratic":
+        f_cmax = fifo_cmax if fifo_cmax else max(cmax, 1.0)
+        f_kit = fifo_kit if fifo_kit else max(kit_span, 1.0)
+        f_load = fifo_load if fifo_load else max(load_diff, 0.5)
+        c = cmax / max(f_cmax, 1e-9)
+        k = kit_span / max(f_kit, 1e-9)
+        l = load_diff / max(f_load, 1e-9)
+        w_c = float(getattr(cfg, "obj_weight_cmax", 0.4))
+        w_k = float(getattr(cfg, "obj_weight_kit", 0.4))
+        w_l = float(getattr(cfg, "obj_weight_load", 0.2))
+        alpha = float(getattr(cfg, "quadratic_penalty_cmax", 5.0))
+        beta = float(getattr(cfg, "quadratic_penalty_kit", 5.0))
+        gamma = float(getattr(cfg, "quadratic_penalty_load", 2.0))
+        base = (
+            w_c * c * c
+            + w_k * k * k
+            + w_l * l * l
+            + alpha * max(0.0, c - 1.0) ** 2
+            + beta * max(0.0, k - 1.0) ** 2
+            + gamma * max(0.0, l - 1.0) ** 2
+        )
+    else:
+        f_cmax = fifo_cmax if fifo_cmax else ModelConfig.CMAX_TARGET_H
+        f_kit = fifo_kit if fifo_kit else max(kit_span + 1.0, 0.1)
+        f_load = fifo_load if fifo_load else max(load_diff, 0.5)
+        norm_cmax = cmax / max(f_cmax, 1.0)
+        norm_load = load_diff / max(f_load, 0.1)
+        kit_target = ModelConfig.KITSPAN_TARGET_H
+        if kit_span <= kit_target:
+            norm_kit = (kit_target / max(f_kit, 0.1)) * 0.5 + (kit_span / max(f_kit, 0.1)) * 0.5
+        else:
+            excess = (kit_span - kit_target) / kit_target
+            norm_kit = (kit_span / max(f_kit, 0.1)) * (1.0 + excess)
+        base = (
+            float(getattr(cfg, "obj_weight_cmax", 0.40)) * norm_cmax
+            + float(getattr(cfg, "obj_weight_kit", 0.40)) * norm_kit
+            + float(getattr(cfg, "obj_weight_load", 0.20)) * norm_load
+        )
+        if cmax > ModelConfig.CMAX_TARGET_H:
+            base += 5.0 * (cmax - ModelConfig.CMAX_TARGET_H) / ModelConfig.CMAX_TARGET_H
+        if fifo_cmax and cmax > fifo_cmax:
+            base += 2.0 * (cmax - fifo_cmax) / fifo_cmax
+        buffer_penalty = 0.0
+        for key, val in metrics.items():
+            if "码垛峰值占用率" in key and isinstance(val, (int, float)):
+                if val > 0.85:
+                    buffer_penalty += (val - 0.85) * 0.30
+        base += 0.05 * buffer_penalty
+
+    idle_h = float(metrics.get("胎架累计空闲时间(h)", 0.0))
+    idle_weight = float(getattr(cfg, "platen_idle_weight", 0.01))
+    return base + idle_weight * idle_h
+
+
+def select_best_by_legacy(
+    candidates,
+    cfg: ModelConfig,
+    objective_type: str | None = None,
+    fifo_cmax: float | None = None,
+    fifo_kit: float | None = None,
+    fifo_load: float | None = None,
+):
+    """从候选解中按原有“兼顾三指标”评价选择最优。"""
+    if not candidates:
+        return None, None, None
+    best = min(
+        candidates,
+        key=lambda c: legacy_balanced_objective(
+            c[2],
+            cfg,
+            objective_type=objective_type,
+            fifo_cmax=fifo_cmax,
+            fifo_kit=fifo_kit,
+            fifo_load=fifo_load,
+        ),
+    )
+    return best
+
+
+def select_best_by_track(
+    candidates,
+    cfg: ModelConfig,
+    objective_type: str | None = None,
+    fifo_cmax: float | None = None,
+    fifo_kit: float | None = None,
+    fifo_load: float | None = None,
+):
+    """按 cfg.eval_track 选择：capacity=当前产能优先，balanced=原三指标。"""
+    track = getattr(cfg, "eval_track", "capacity")
+    if track == "balanced":
+        return select_best_by_legacy(
+            candidates, cfg, objective_type=objective_type,
+            fifo_cmax=fifo_cmax, fifo_kit=fifo_kit, fifo_load=fifo_load,
+        )
+    return select_best_by_capacity(candidates, cfg, objective_type=objective_type)
 
 
 def objective(metrics: Dict[str, float], cfg: ModelConfig | None = None) -> float:
