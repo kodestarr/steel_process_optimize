@@ -1,0 +1,344 @@
+/* ── Model Architecture — layered pipeline visualisation ── */
+/* P2-1: 全面替换硬编码颜色为 CSS 变量，支持深色/浅色双主题 */
+
+.ma-container {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+/* ── Layer card (common) ─────────────────────────────── */
+.ma-layer {
+  background: var(--bg-card);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  margin-bottom: 20px;
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+
+.ma-layer-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #FFFFFF;  /* headers stay white-on-color for contrast */
+}
+
+/* Layer header accent colours — kept brand-coded for visual hierarchy */
+.ma-layer-header.l0 { background: #1E3A5F; }  /* input */
+.ma-layer-header.l1 { background: #2563EB; }  /* validation */
+.ma-layer-header.l2 { background: #6366F1; }  /* features */
+.ma-layer-header.l3 { background: #7C3AED; }  /* scheduling */
+.ma-layer-header.l4 { background: #DB2777; }  /* simulation ⭐ */
+.ma-layer-header.l5 { background: #059669; }  /* output */
+.ma-layer-header.l6 { background: #D97706; }  /* optimizer */
+.ma-layer-header.l7 { background: #475569; }  /* params */
+.ma-layer-header.l8 { background: #0F172A; }  /* formula */
+
+.ma-layer-body {
+  padding: 18px 20px;
+}
+
+/* ── Down arrow between layers ───────────────────────── */
+.ma-layer-arrow {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 20px;
+}
+.ma-layer-arrow span {
+  font-size: 20px;
+  color: var(--text-tertiary);
+  line-height: 1;
+}
+
+/* ── Input two-column ────────────────────────────────── */
+.ma-input-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.ma-input-col {
+  background: var(--bg-sidebar);
+  border-radius: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+}
+
+.ma-input-col h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ma-input-col ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.8;
+}
+
+/* ── Check list ──────────────────────────────────────── */
+.ma-check-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 16px;
+}
+.ma-check-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-primary);
+  padding: 4px 0;
+}
+.ma-check-item .icon-ok  { color: #10B981; font-size: 14px; }
+.ma-check-item .icon-warn { color: #F59E0B; font-size: 14px; }
+
+/* ── Feature cards ───────────────────────────────────── */
+.ma-feature-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+.ma-feature-card {
+  background: var(--bg-sidebar);
+  border-radius: 8px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  text-align: center;
+}
+.ma-feature-card .fc-icon { font-size: 22px; margin-bottom: 6px; }
+.ma-feature-card .fc-name { font-size: 12px; font-weight: 600; color: var(--text-primary); margin-bottom: 4px; }
+.ma-feature-card .fc-desc { font-size: 10px; color: var(--text-tertiary); line-height: 1.4; }
+
+/* ── Decision row ────────────────────────────────────── */
+.ma-decision-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.ma-strategy-card {
+  background: var(--bg-sidebar);
+  border-radius: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+}
+
+.ma-strategy-card h4 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #7C3AED;
+}
+
+.ma-strategy-card p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* ── Resource table ──────────────────────────────────── */
+.ma-res-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 12px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.ma-res-table thead th {
+  background: var(--bg-sidebar);
+  padding: 8px 12px;
+  text-align: left;
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ma-res-table tbody td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--divider);
+  color: var(--text-primary);
+}
+.ma-res-table tbody td.dim { color: var(--text-tertiary); font-size: 11px; }
+
+/* ── Process routes ──────────────────────────────────── */
+.ma-routes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 14px;
+}
+.ma-route {
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.ma-route-header {
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+}
+.ma-route-header.small { background: #10B981; }
+.ma-route-header.large { background: #3B82F6; }
+
+.ma-route-body {
+  padding: 10px 14px;
+  background: var(--bg-sidebar);
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.7;
+}
+
+/* ── Buffer logic ────────────────────────────────────── */
+.ma-buffer-box {
+  margin-top: 14px;
+  background: var(--warningLight, #FFFBEB);
+  border: 1px solid #FDE68A;
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-size: 12px;
+  color: var(--text-primary);
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+}
+
+/* ── Output grid ─────────────────────────────────────── */
+.ma-output-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.ma-output-card {
+  background: var(--bg-sidebar);
+  border-radius: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+}
+.ma-output-card h4 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.ma-output-card p {
+  margin: 0;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}
+
+/* ── KPI list ────────────────────────────────────────── */
+.ma-kpi-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 20px;
+  font-size: 12px;
+  color: var(--text-primary);
+  line-height: 1.8;
+}
+
+.ma-kpi-list .kpi-name { font-weight: 500; }
+.ma-kpi-list .kpi-formula { color: var(--text-tertiary); font-size: 11px; }
+
+/* ── Optimizer steps ─────────────────────────────────── */
+.ma-opt-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.ma-opt-step {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.ma-opt-num {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #D97706;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.ma-opt-body {
+  flex: 1;
+  background: var(--bg-sidebar);
+  border-radius: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.ma-strat-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  margin: 8px 0;
+}
+.ma-strat-tag {
+  text-align: center;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #fff;
+}
+.ma-strat-tag.s0 { background: #64748B; }
+.ma-strat-tag.s1 { background: #3B82F6; }
+.ma-strat-tag.s2 { background: #6366F1; }
+.ma-strat-tag.s3 { background: #8B5CF6; }
+.ma-strat-tag.s4 { background: #7C3AED; }
+
+/* ── Formula card ────────────────────────────────────── */
+.ma-formula-dark {
+  background: #0F172A;
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin-top: 12px;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 12px;
+  line-height: 1.9;
+  color: #CBD5E1;
+}
+/* Dark mode formula: keep dark background with lighter text */
+[data-theme='dark'] .ma-formula-dark {
+  background: #020617;
+  color: #E2E8F0;
+}
+.ma-formula-dark .hl { color: #60A5FA; }
+.ma-formula-dark .hg { color: #34D399; }
+.ma-formula-dark .ho { color: #FBBF24; }
+.ma-formula-dark .dim { color: #64748B; }
+[data-theme='dark'] .ma-formula-dark .dim { color: #94A3B8; }
+
+/* ── Param tree ──────────────────────────────────────── */
+.ma-param-tree {
+  font-size: 12px;
+  line-height: 2;
+  color: var(--text-primary);
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+}
+
+.ma-param-tree .branch { color: #7C3AED; font-weight: 600; }
+.ma-param-tree .leaf { color: var(--text-secondary); }
+.ma-param-tree .val { color: #3B82F6; }
+.ma-param-tree .comment { color: var(--text-tertiary); }
+
+/* ── Dark mode overrides for AntD-incompatible sections ── */
+[data-theme='dark'] .ma-layer-header.l7 { background: #334155; }
+[data-theme='dark'] .ma-layer-header.l8 { background: #020617; }
+[data-theme='dark'] .ma-param-tree .branch { color: #A78BFA; }

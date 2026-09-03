@@ -1,0 +1,41 @@
+# Environments and caches
+.venv/
+**/__pycache__/
+*.py[cod]
+.pnpm-store/
+**/node_modules/
+
+# Local agent state
+.agents/
+.claude/
+.codex/
+
+# Generated outputs and runtime data
+outputs/
+**/outputs/
+backend/results/
+**/backend/results/
+backend/uploads/
+**/backend/uploads/
+backend/history.json.lock
+**/backend/history.json.lock
+backend/history.json
+**/backend/history.json
+frontend/dist/
+**/frontend/dist/
+report_render/
+**/report_render/
+*.zip
+drl_qtable.npy
+**/drl_qtable.npy
+*.npy
+**/*.npy
+新建 文本文档.txt
+挑战杯 demo6/挑战杯/frontend/C*
+
+# Personal registration materials
+/报名/
+
+# Duplicate snapshots that are not part of the main repository
+/挑战杯 demo6/挑战杯 - 副本*/
+/新建文件夹/
