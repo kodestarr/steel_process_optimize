@@ -60,8 +60,8 @@ class ModelConfig:
     use_component_formula: bool = True  # True=分项明细公式：直切+V坡+空行程+划线（穿孔已折算，不重复计入）
     local_search_iterations: int = 800
     random_seed: int = 20260723
-    optimizer_method: str = "sa_tabu"  # sa_tabu=SA+Tabu, ga_lns=GA+LNS
-    objective_type: str = "linear"     # linear=线性评价, quadratic=二次非线性评价
+    optimizer_method: str = "sa_tabu"  # sa_tabu | ga_lns | dq_nsga2
+    objective_type: str = "linear"     # linear | quadratic | auto
     eval_track: str = "capacity"       # capacity=产能优先(当前), balanced=兼顾三指标(原评价)
     ga_population_size: int = 16
     ga_generations: int = 10
@@ -70,6 +70,11 @@ class ModelConfig:
     ga_tournament_size: int = 3
     lns_destroy_ratio: float = 0.25
     lns_iterations: int = 4
+    # ── DQN + 改进 NSGA-II（多目标 Pareto）──
+    nsga2_archive_size: int = 80       # Pareto 档案最大个体数
+    dqn_seed_count: int = 4            # DQN 初始机器码种子数上限，0=纯启发式
+    dqn_model_path: str = "dqn_machine_model.pt"
+    dqn_use_gpu: bool = False          # 本地 Intel/无GPU时固定CPU，交付后可切换
     # ── 产能优先目标参数（P4-1：产能作为第一优先级，辅助指标只做1%内微调）──
     capacity_eps: float = 0.009          # 产能差1%时，产能优的解必须赢
     capacity_tolerance_pct: float = 0.01 # 最终选解时产能差在此范围内才比较辅助指标
@@ -1246,7 +1251,8 @@ def build_joint_schedule(
         nxt_name = str(nxt["套料图名"])
         if nxt_name in prebooked_raw or bool(nxt.get("_fixed", False)):
             return False
-        m = pick_machine(nxt, free)
+        assigned_m = str(nxt.get("切割机")) if pd.notna(nxt.get("切割机")) else None
+        m = assigned_m if assigned_m in free else pick_machine(nxt, free)
         cand: list[int] = []
         for ti in (0, 1):
             if m == cur_machine and ti == cur_table:
@@ -2523,9 +2529,9 @@ def monte_carlo_robustness(
 
 
 def optimise(features: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, pp: ProcessParams | None = None) -> Tuple[pd.DataFrame, Dict[str, float], pd.DataFrame, pd.DataFrame]:
-    """按 ModelConfig 选择 SA+Tabu 或 GA+LNS 进行齐套感知排产优化。
+    """按 ModelConfig 选择 SA+Tabu、GA+LNS 或 DQN+NSGA-II 进行齐套感知排产优化。
 
-    评价函数也按 cfg.objective_type 选择线性或二次非线性。
+    评价函数也按 cfg.objective_type 选择线性或二次非线性；DQN+NSGA-II 使用多目标自动匹配。
     """
     method = getattr(cfg, "optimizer_method", "sa_tabu")
     objective_type = getattr(cfg, "objective_type", "linear")
@@ -2533,6 +2539,25 @@ def optimise(features: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, pp: 
         method = "sa_tabu"
         objective_type = "quadratic"
 
+    if method == "dq_nsga2":
+        from dqn_nsga2_optimizer import run_dq_nsga2_pareto_front
+
+        front = run_dq_nsga2_pareto_front(
+            plates=None,
+            parts=parts,
+            features=features,
+            cfg=cfg,
+            pp=pp,
+            speed_table=pp.speed_table if pp else None,
+            checks={},
+            iterations=cfg.local_search_iterations,
+        )
+        track = getattr(cfg, "eval_track", "capacity")
+        result = front[track]
+        schedule = result["schedule"]
+        metrics = result["metrics"]
+        _, groups, _, stages, _ = simulate(schedule, parts, cfg, pp)
+        return schedule, metrics, groups, stages
     if method == "ga_lns":
         from ga_lns_optimizer import run_ga_lns_optimization
         result = run_ga_lns_optimization(

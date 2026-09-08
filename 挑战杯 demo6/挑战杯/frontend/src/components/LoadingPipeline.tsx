@@ -15,24 +15,8 @@ interface Props {
 
 const LoadingPipeline: React.FC<Props> = ({ visible, progress }) => {
   const [step, setStep] = useState(0);
-  const [localElapsed, setLocalElapsed] = useState(0);
   const elapsed = progress?.elapsed ?? 0;
   const stageLabel = progress?.stage ?? '';
-
-  // 独立计时：即使外层进度轮询被节流，已运行时间也会每秒刷新。
-  useEffect(() => {
-    if (!visible) {
-      setLocalElapsed(0);
-      return;
-    }
-    setLocalElapsed(0);
-    const timer = setInterval(() => {
-      setLocalElapsed((e) => e + 1);
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [visible]);
-
-  const displayElapsed = Math.max(elapsed, localElapsed);
 
   // P0-9 FIX: Decouple stage cycling from progress updates.
   // Previously, `progress` changed every 2s, which cleared the 3s setInterval
@@ -67,7 +51,7 @@ const LoadingPipeline: React.FC<Props> = ({ visible, progress }) => {
         <div className="loading-title">模型计算中</div>
         <div className="loading-subtitle">
           {stageLabel || '正在为您优化钢板排产方案'}
-          {displayElapsed > 0 && <span style={{ marginLeft: 8, opacity: 0.7 }}>已运行 {Math.floor(displayElapsed)}s</span>}
+          <span style={{ marginLeft: 8, opacity: 0.7 }}>已运行 {elapsed.toFixed(1)}s</span>
         </div>
 
         {/* 进度条 */}

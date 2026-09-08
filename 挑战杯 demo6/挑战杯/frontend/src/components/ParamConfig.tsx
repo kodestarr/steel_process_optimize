@@ -69,6 +69,8 @@ export const DEFAULT_PARAMS: ModelParams = {
   ga_tournament_size: 3,
   lns_destroy_ratio: 0.25,
   lns_iterations: 4,
+  dqn_seed_count: 4,
+  nsga2_archive_size: 80,
   // P1-1: 暴露后端关键幽灵参数
   crane_overlap_minutes: 3.0,
   crane_return_ratio: 1.0,
@@ -281,7 +283,7 @@ const ParamConfig: React.FC<Props> = ({ params, onChange, upload }) => {
                 <Row align="middle" style={{ marginBottom: 12 }}>
                   <Col span={8}>
                     <Text style={{ fontSize: 13 }}>进化算法</Text>
-                    <Tooltip title="SA+Tabu 和 GA+LNS 共用同一套仿真评估；GA+LNS 以遗传算法为主，并对精英解做 LNS 局部精修">
+                    <Tooltip title="SA+Tabu / GA+LNS 为标量搜索；DQN+NSGA-II 先由 DQN 生成机器码种子，再运行多目标 Pareto 进化，评价函数自动匹配">
                       <QuestionCircleOutlined style={{ marginLeft: 4, color: '#94A3B8', cursor: 'help', fontSize: 13 }} />
                     </Tooltip>
                   </Col>
@@ -290,11 +292,21 @@ const ParamConfig: React.FC<Props> = ({ params, onChange, upload }) => {
                       key={params.optimizer_method}
                       size="small"
                       value={optimizerMethod(params)}
-                      onChange={(v) => set('optimizer_method', String(v))}
+                      onChange={(v) => {
+                        const method = String(v);
+                        const prevObjective =
+                          params.objective_type === 'auto' ? 'linear' : params.objective_type;
+                        onChange((prev) => ({
+                          ...prev,
+                          optimizer_method: method,
+                          objective_type: method === 'dq_nsga2' ? 'auto' : prevObjective,
+                        }));
+                      }}
                       style={{ width: '100%' }}
                       options={[
                         { value: 'sa_tabu', label: 'SA+Tabu' },
                         { value: 'ga_lns', label: 'GA+LNS' },
+                        { value: 'dq_nsga2', label: 'DQN+NSGA-II' },
                       ]}
                     />
                   </Col>
@@ -311,11 +323,13 @@ const ParamConfig: React.FC<Props> = ({ params, onChange, upload }) => {
                       key={params.objective_type}
                       size="small"
                       value={params.objective_type}
+                      disabled={optimizerMethod(params) === 'dq_nsga2'}
                       onChange={(v) => set('objective_type', String(v))}
                       style={{ width: '100%' }}
                       options={[
                         { value: 'linear', label: '线性评价' },
                         { value: 'quadratic', label: '二次非线性评价' },
+                        { value: 'auto', label: '自动匹配（多目标Pareto）', disabled: optimizerMethod(params) !== 'dq_nsga2' },
                       ]}
                     />
                   </Col>
@@ -327,6 +341,15 @@ const ParamConfig: React.FC<Props> = ({ params, onChange, upload }) => {
                     <ParamRow label="GA种群规模" tooltip="每代保留的钢板排列个体数" value={params.ga_population_size} min={4} max={64} step={2} unit="个" onChange={(v) => set('ga_population_size', v)} />
                     <ParamRow label="GA代数" value={params.ga_generations} min={1} max={50} step={1} unit="代" onChange={(v) => set('ga_generations', v)} />
                     <ParamRow label="LNS毁坏比例" tooltip="LNS每次移除的钢板比例，0.2~0.4较合适" value={params.lns_destroy_ratio} min={0.1} max={0.5} step={0.05} unit="比例" onChange={(v) => set('lns_destroy_ratio', v)} />
+                  </>
+                )}
+                {params.optimizer_method === 'dq_nsga2' && (
+                  <>
+                    <ParamRow label="NSGA-II种群规模" tooltip="每代保留的 钢板顺序+机器码 个体数" value={params.ga_population_size} min={4} max={64} step={2} unit="个" onChange={(v) => set('ga_population_size', v)} />
+                    <ParamRow label="NSGA-II代数" value={params.ga_generations} min={1} max={50} step={1} unit="代" onChange={(v) => set('ga_generations', v)} />
+                    <ParamRow label="NSGA-II交叉率" value={params.ga_crossover_rate} min={0.5} max={1} step={0.05} unit="比例" onChange={(v) => set('ga_crossover_rate', v)} />
+                    <ParamRow label="NSGA-II变异率" value={params.ga_mutation_rate} min={0.05} max={0.8} step={0.05} unit="比例" onChange={(v) => set('ga_mutation_rate', v)} />
+                    <ParamRow label="DQN初始种子数上限" tooltip="只在模型存在且当前数据特征与训练范围接近时启用；设为0表示完全使用启发式机器码" value={params.dqn_seed_count} min={0} max={32} step={1} unit="个" onChange={(v) => set('dqn_seed_count', v)} />
                   </>
                 )}
                 <Row align="middle" style={{ marginBottom: 12 }}>

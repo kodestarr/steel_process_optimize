@@ -46,8 +46,8 @@ export interface ModelParams {
   truss_travel_minutes: number;
   local_search_iterations: number;
   random_seed: number;
-  optimizer_method: string;  // 'sa_tabu' | 'ga_lns'
-  objective_type: string;    // 'linear' | 'quadratic'
+  optimizer_method: string;  // 'sa_tabu' | 'ga_lns' | 'dq_nsga2'
+  objective_type: string;    // 'linear' | 'quadratic' | 'auto'
   ga_population_size: number;
   ga_generations: number;
   ga_crossover_rate: number;
@@ -55,6 +55,8 @@ export interface ModelParams {
   ga_tournament_size: number;
   lns_destroy_ratio: number;
   lns_iterations: number;
+  dqn_seed_count: number;
+  nsga2_archive_size: number;
   // P1-1: 暴露后端关键幽灵参数
   crane_overlap_minutes: number;
   crane_return_ratio: number;

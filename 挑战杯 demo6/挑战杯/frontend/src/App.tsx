@@ -92,12 +92,12 @@ const App: React.FC = () => {
       const elapsed = (Date.now() - loadStartRef.current) / 1000;
       // 根据已用时间粗略估计阶段（标注"预计"，非虚假精准进度）
       let stage = '预计：数据准备中...';
-      if (elapsed > 120) stage = '预计：DRL增强搜索中...';
-      else if (elapsed > 60) stage = '预计：SA+Tabu 迭代优化中...';
+      if (elapsed > 120) stage = '预计：多目标/DRL增强搜索中...';
+      else if (elapsed > 60) stage = '预计：进化算法迭代优化中...';
       else if (elapsed > 15) stage = '预计：离散事件仿真中...';
       else if (elapsed > 5) stage = '预计：切割工时计算中...';
       setLoadProgress({ elapsed, stage });
-    }, 2000);  // 降低轮询频率至2s，减少不必要的渲染
+    }, 250);  // 高频刷新预计耗时，加载层直接使用该 elapsed
 
     try {
       const res = await runPromise;
@@ -300,7 +300,13 @@ const App: React.FC = () => {
           <HistorySidebar activeRunId={activeRunId} onSelect={handleHistorySelect} collapsed={sidebarCollapsed} />
         </div>
         <div className="app-content">
-          <Tabs activeKey={activeTab} onChange={setActiveTab} items={tabItems} size="large" />
+          <Tabs
+            key={`${activeRunId ?? (result?.run_id ?? 'no-run')}-${reportMode}`}
+            activeKey={activeTab}
+            onChange={setActiveTab}
+            items={tabItems}
+            size="large"
+          />
         </div>
       </div>
     </div>

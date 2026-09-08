@@ -134,10 +134,19 @@ class SATabuOptimizer:
                 break
         return order
 
-    def schedule_from_order(self, order_names: list[str]):
-        """Build a multi-machine schedule from a plate order, with crane interlock."""
+    def schedule_from_order(
+        self,
+        order_names: list[str],
+        machine_assignments: dict[str, str] | None = None,
+    ):
+        """Build a multi-machine schedule from a plate order, with crane interlock.
+
+        machine_assignments is optional: when provided, N2/N5/N8 decisions from a
+        DQN/NSGA-II machine code are honored; invalid machines fall back to the
+        standard earliest-free heuristic so the schedule always remains feasible.
+        """
         order_names = self._enforce_first_plate(order_names)
-        key = self._hash_order(order_names)
+        key = self._hash_order(order_names, machine_assignments)
         if key in self._eval_cache:
             return self._eval_cache[key]
         # Evict oldest entries if cache exceeds limit
@@ -157,7 +166,25 @@ class SATabuOptimizer:
         crane_pool = CranePool()
         rows = []
         for seq_i, (_, r) in enumerate(ordered.iterrows(), 1):
-            m = pick_machine(r, free)
+            if machine_assignments is None:
+                m = pick_machine(r, free)
+            else:
+                from steel_schedule_model import (
+                    N5_MAX_THICKNESS_MM,
+                    N5_MAX_WIDTH_MM,
+                    _plate_thickness,
+                    _plate_width,
+                )
+                requested = machine_assignments.get(str(r[self.name_col]))
+                width = _plate_width(r)
+                n5_allowed = (
+                    requested != "N5"
+                    or (
+                        _plate_thickness(r) <= N5_MAX_THICKNESS_MM
+                        and (width is None or width <= N5_MAX_WIDTH_MM)
+                    )
+                )
+                m = requested if (requested in machines and n5_allowed) else pick_machine(r, free)
             raw_start, raw_empty_end, raw_loaded_end = _reserve_raw_material_crane(
                 crane_pool, min(worktables[m]), self.cfg,
             )
@@ -215,7 +242,10 @@ class SATabuOptimizer:
         return result
 
     @staticmethod
-    def _hash_order(order: list[str]) -> str:
+    def _hash_order(
+        order: list[str],
+        machine_assignments: dict[str, str] | None = None,
+    ) -> str:
         """P3-1: 使用完整序列哈希替代局部采样，消除MD5碰撞风险。
 
         原采样模式（首5+每10个+尾5）可能导致不同排列产生相同哈希，
@@ -225,6 +255,10 @@ class SATabuOptimizer:
         """
         # 使用完整序列：拼接所有板名，用不可分割分隔符连接
         full = '\x00'.join(order)
+        if machine_assignments is not None:
+            full += '\x01' + '\x00'.join(
+                str(machine_assignments.get(x, "")) for x in order
+            )
         return hashlib.md5(full.encode('utf-8')).hexdigest()
 
     # ── Kit-span focused objective ────────────────────────

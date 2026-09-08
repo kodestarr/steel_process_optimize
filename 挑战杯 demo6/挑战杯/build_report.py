@@ -84,6 +84,8 @@ def main():
     groups = pd.read_csv(args.results / "kit_groups.csv")
     schedule = pd.read_csv(args.results / "optimized_plate_schedule.csv")
     checks = summary["数据校验"]; base = summary["FIFO基线"]; opt = summary["齐套感知优化"]
+    algorithm_name = str(summary.get("算法名称", ""))
+    is_dq_nsga2 = "DQN" in algorithm_name
 
     doc = Document(); sec = doc.sections[0]
     sec.top_margin = sec.bottom_margin = sec.left_margin = sec.right_margin = Inches(1)
@@ -124,9 +126,15 @@ def main():
     heading(doc, "2.2 工时与目标函数", 2)
     add_para(doc, "切割工时由直切、V坡、空行程、划线、穿孔和换板准备构成。速度与设备参数集中存放在 ModelConfig 中，以便将附件3的正式公式直接替换。")
     add_para(doc, "T_cut = L_cut/v_cut + L_V/v_V + L_empty/v_rapid + L_mark/v_mark + n_pierce·t_pierce + t_setup", 11, True, NAVY, 10, align=WD_ALIGN_PARAGRAPH.CENTER)
-    add_para(doc, "优化评价函数为 J = 0.40·Cmax + 0.40·Tkit + 0.20·ΔL。其中 Cmax 为总完工时间，Tkit 为按零件数加权的平均齐套跨度，ΔL 为N2/N5切割负载差。权重可在比赛答疑明确评分口径后调整。", 10.5, False, "222222", 8)
+    if is_dq_nsga2:
+        add_para(doc, "本组结果采用 DQN+NSGA-II 多目标框架：目标向量为产能效率(Cmax/LB)、加权平均齐套跨度、切割负载差和总等待时间，不预先压缩为单一线性/二次评价。NSGA-II 输出 Pareto 前沿后，再分别按产能优先和兼顾三指标两种规则从同一前沿选择交付解。", 10.5, False, "222222", 8)
+    else:
+        add_para(doc, "优化评价函数为 J = 0.40·Cmax + 0.40·Tkit + 0.20·ΔL。其中 Cmax 为总完工时间，Tkit 为按零件数加权的平均齐套跨度，ΔL 为N2/N5切割负载差。权重可在比赛答疑明确评分口径后调整。", 10.5, False, "222222", 8)
     heading(doc, "2.3 求解方法", 2)
-    add_para(doc, "首先构造 FIFO 基线；然后采用“交换两张钢板”与“前插一张钢板”两类邻域的受控随机局部搜索。每一个候选排序均运行完整离散事件仿真，而非仅用静态加工时长估计，从而让齐套、下游工序和AGV资源约束共同影响评价。")
+    if is_dq_nsga2:
+        add_para(doc, "求解器保留“钢板顺序 -> 仿真 -> 指标向量”的黑盒评估，并将 N2/N5/N8 机器码显式纳入个体。DQN 在模型文件存在时生成高质量机器码初始种群；模型缺失时自动退回启发式机器码。NSGA-II 采用非支配排序、拥挤度和代际衰减的概率精英保留，单次运行输出 Pareto 前沿，避免把多目标压缩成单目标后出现产能被齐套大幅置换的问题。", 10.5, False, "222222", 8)
+    else:
+        add_para(doc, "首先构造 FIFO 基线；然后采用“交换两张钢板”与“前插一张钢板”两类邻域的受控随机局部搜索。每一个候选排序均运行完整离散事件仿真，而非仅用静态加工时长估计，从而让齐套、下游工序和AGV资源约束共同影响评价。")
 
     heading(doc, "3  默认参数情景实验")
     add_para(doc, "默认情景设置为：N2/N5两台切割机、1台自动分拣、1台小件自动打磨机、2个人工打磨工位、1台自动坡口机、2个人工坡口工位、1台AGV以及50件成品缓存。该配置仅用于验证模型流程，必须以题目附件或企业数据更新。", 10.5, False, "222222", 8)
@@ -134,7 +142,10 @@ def main():
     for _, r in comparison.iterrows():
         rows.append([r["方案"], f"{r['总完工时间(h)']:.2f}", f"{r['加权平均齐套跨度(h)']:.2f}", f"{r['最大齐套跨度(h)']:.2f}", f"{r['切割负载差(h)']:.2f}"])
     add_table(doc, ["方案", "总完工(h)", "平均齐套跨度(h)", "最大齐套跨度(h)", "切割负载差(h)"], rows, [1.55, 1.2, 1.45, 1.45, 0.85])
-    add_para(doc, "结果解释：在目前的默认参数与目标权重下，FIFO原始顺序已是本次局部搜索找到的最优解，因此模型没有虚构改善率。该现象说明需要使用附件3的真实速度、物流和资源数据才能形成有意义的现场改进结论。", 10.5, True, "7A5A00", 9)
+    if is_dq_nsga2:
+        add_para(doc, "结果解释：上表来自同一次 DQN+NSGA-II 运行产生的 Pareto 前沿，重工时版与兼顾三指标版是从同一前沿分别选出的交付解。若两版关键指标接近，说明前沿在该区域已经收敛，属于正常结果，不代表优化器失效。", 10.5, True, "7A5A00", 9)
+    else:
+        add_para(doc, "结果解释：在目前的默认参数与目标权重下，FIFO原始顺序已是本次局部搜索找到的最优解，因此模型没有虚构改善率。该现象说明需要使用附件3的真实速度、物流和资源数据才能形成有意义的现场改进结论。", 10.5, True, "7A5A00", 9)
     for img, caption in [("cutting_gantt.png", "图1 优化方案的N2/N5切割甘特图"), ("kit_span.png", "图2 各齐套组的齐套跨度"), ("resource_utilisation.png", "图3 后续资源利用率")]:
         image_path = args.results / img
         if image_path.exists():

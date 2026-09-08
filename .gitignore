@@ -4,6 +4,24 @@
 *.py[cod]
 .pnpm-store/
 **/node_modules/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.log
+
+# Editor / OS files
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Trained model artifacts
+*.pt
+*.pt.meta.json
+*.pth
+*.onnx
 
 # Local agent state
 .agents/

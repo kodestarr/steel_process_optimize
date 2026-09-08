@@ -20,7 +20,9 @@ const ResultOverview: React.FC<Props> = ({ data, prevData }) => {
   const { metrics } = data;
   const opt = metrics.optimized;
   const algorithmName = data.algorithmName ?? 'SA+Tabu（线性评价）';
-  const objectiveText = algorithmName.includes('二次')
+  const objectiveText = algorithmName.includes('DQN+NSGA-II')
+    ? '优化目标: 多目标Pareto自动匹配（产能/齐套/负载/等待，无线性二次选择）'
+    : algorithmName.includes('二次')
     ? '优化目标: FIFO相对二次函数 0.40c² + 0.40k² + 0.20l² + 二次惩罚'
     : '优化目标: 0.40×Cmax + 0.40×平均齐套跨度 + 0.20×切割负载差';
 

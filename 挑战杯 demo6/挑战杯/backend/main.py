@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import math
 import os
 import subprocess
@@ -92,6 +93,7 @@ from improved_optimizer import run_multi_strategy_inline  # noqa: E402
 from drl_optimizer import run_drl_enhanced_optimization  # noqa: E402
 from pareto_optimizer import run_quadratic_optimization  # noqa: E402
 from ga_lns_optimizer import run_ga_lns_optimization  # noqa: E402
+from dqn_nsga2_optimizer import run_dq_nsga2_pareto_front  # noqa: E402
 
 # ── 目录 ──────────────────────────────────────────────
 UPLOAD_DIR = Path(__file__).parent / "uploads"
@@ -257,12 +259,16 @@ def _objective_display_name(cfg) -> str:
     objective_type = getattr(cfg, "objective_type", "linear")
     if objective_type == "quadratic":
         return "二次非线性评价"
+    if objective_type == "auto":
+        return "多目标Pareto自动匹配"
     return "线性评价"
 
 
 def _optimizer_display_name(cfg) -> str:
     """返回当前使用的进化算法 + 评价函数展示名称。"""
     method = getattr(cfg, "optimizer_method", "sa_tabu")
+    if method == "dq_nsga2":
+        return "DQN+NSGA-II（多目标自动匹配）"
     if method == "quadratic":  # 旧版兼容：quadratic 表示 SA+Tabu + 二次评价
         return "SA+Tabu + 二次非线性评价"
     if method == "ga_lns":
@@ -279,9 +285,12 @@ def _run_model(
     speed_table_path: str | None = None,
     eval_track: str = "capacity",
     progress_tag: str | None = None,
+    manage_progress: bool = True,
+    pareto_front_store: dict | None = None,
 ):
     """运行完整建模管线，将结果写入 out_dir 并返回结构化数据。"""
     out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = copy.deepcopy(cfg)
     cfg.eval_track = eval_track
     # 加载附件3工艺参数（若提供）
     pp = None
@@ -318,7 +327,28 @@ def _run_model(
         and objective_type == "linear"
         and eval_track == "capacity"
     )
-    if method == "ga_lns":
+    if method == "dq_nsga2":
+        if pareto_front_store is not None and pareto_front_store.get("capacity") is not None:
+            front_result = pareto_front_store
+        else:
+            front_result = run_dq_nsga2_pareto_front(
+                plates, parts, features, cfg, pp, speed_table, checks,
+                iterations=cfg.local_search_iterations,
+                progress_callback=_progress_cb,
+            )
+            if pareto_front_store is not None:
+                pareto_front_store.clear()
+                pareto_front_store.update(front_result)
+        track_result = front_result[eval_track]
+        opt_result = {
+            "schedule": track_result["schedule"],
+            "base_schedule": front_result["base_schedule"],
+            "base_metrics": front_result["base_metrics"],
+            "opt_metrics": track_result["metrics"],
+            "stages": track_result["stages"],
+            "strategy_name": "DQN+NSGA-II",
+        }
+    elif method == "ga_lns":
         opt_result = run_ga_lns_optimization(
             plates, parts, features, cfg, pp, speed_table, checks,
             iterations=cfg.local_search_iterations,
@@ -343,8 +373,9 @@ def _run_model(
             progress_callback=_progress_cb,
         )
     # 清理进度状态
-    with _progress_lock:
-        _optimization_progress.pop(run_tag, None)
+    if manage_progress:
+        with _progress_lock:
+            _optimization_progress.pop(run_tag, None)
     schedule = opt_result["schedule"]
     base_schedule = opt_result["base_schedule"]
     base_metrics = opt_result["base_metrics"]
@@ -454,6 +485,9 @@ def _run_model(
             "ga_mutation_rate": cfg.ga_mutation_rate,
             "ga_tournament_size": cfg.ga_tournament_size,
             "lns_iterations": cfg.lns_iterations,
+            "dqn_seed_count": cfg.dqn_seed_count,
+            "nsga2_archive_size": cfg.nsga2_archive_size,
+            "dqn_model_path": cfg.dqn_model_path,
             "capacity_eps": cfg.capacity_eps,
             "capacity_tolerance_pct": cfg.capacity_tolerance_pct,
             "secondary_weight_kit": cfg.secondary_weight_kit,
@@ -748,6 +782,7 @@ async def run_model(payload: dict):
         "bevel_workstation_capacity",
         "local_search_iterations", "random_seed", "use_component_formula",
         "ga_population_size", "ga_generations", "ga_tournament_size", "lns_iterations",
+        "dqn_seed_count", "nsga2_archive_size",
     }
     for key, value in user_params.items():
         if hasattr(cfg, key):
@@ -766,11 +801,12 @@ async def run_model(payload: dict):
     # 创建结果目录
     run_id = uuid.uuid4().hex[:12]
     out_dir = RESULT_DIR / run_id
+    is_dq_nsga2 = getattr(cfg, "optimizer_method", "sa_tabu") == "dq_nsga2"
 
     try:
         plates, parts, checks = load_and_validate(input_path)
-        # P4-3：双轨并行——产能优先(当前) + 兼顾三指标(原评价)，尽可能占满 CPU
-        from concurrent.futures import ThreadPoolExecutor
+        # P4-3：普通算法双轨并行；DQN+NSGA-II 只跑一次 Pareto 前沿，
+        # 再分别按 capacity/balanced 规则从同一前沿选两个交付解。
         _prev_env = os.environ.get("OPTIMIZER_PARALLEL")
         os.environ["OPTIMIZER_PARALLEL"] = str(max(2, (os.cpu_count() or 4) // 2))
 
@@ -778,16 +814,33 @@ async def run_model(payload: dict):
             target = out_dir if sub is None else out_dir / sub
             return _run_model(
                 plates, parts, cfg, target, checks, speed_table_path,
-                eval_track=track, progress_tag=run_id,
+                eval_track=track, progress_tag=run_id, manage_progress=False,
             )
 
         try:
-            with ThreadPoolExecutor(max_workers=2) as _dual_exec:
-                _fut_cap = _dual_exec.submit(_run_one, "capacity", None)
-                _fut_bal = _dual_exec.submit(_run_one, "balanced", "balanced")
-                result = _fut_cap.result()
-                balanced_result = _fut_bal.result()
+            if is_dq_nsga2:
+                front_store: dict = {}
+                result = _run_model(
+                    plates, parts, cfg, out_dir, checks, speed_table_path,
+                    eval_track="capacity", progress_tag=run_id,
+                    manage_progress=False, pareto_front_store=front_store,
+                )
+                balanced_result = _run_model(
+                    plates, parts, cfg, out_dir / "balanced", checks, speed_table_path,
+                    eval_track="balanced", progress_tag=run_id,
+                    manage_progress=False, pareto_front_store=front_store,
+                )
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(max_workers=2) as _dual_exec:
+                    _fut_cap = _dual_exec.submit(_run_one, "capacity", None)
+                    _fut_bal = _dual_exec.submit(_run_one, "balanced", "balanced")
+                    result = _fut_cap.result()
+                    balanced_result = _fut_bal.result()
         finally:
+            with _progress_lock:
+                _optimization_progress.pop(run_id, None)
             if _prev_env is None:
                 os.environ.pop("OPTIMIZER_PARALLEL", None)
             else:
@@ -825,7 +878,10 @@ async def run_model(payload: dict):
     balanced_result["files"] = {k: f"{run_id}/balanced/{v}" for k, v in _file_map.items()}
     result["reportMode"] = "capacity"
     result["algorithmName"] = f"{result.get('algorithmName', '优化')}（产能优先/重工时）"
-    balanced_result["algorithmName"] = f"{balanced_result.get('algorithmName', '优化')}（兼顾三指标/原评价）"
+    if is_dq_nsga2:
+        balanced_result["algorithmName"] = f"{balanced_result.get('algorithmName', '优化')}（兼顾三指标/Pareto综合选解）"
+    else:
+        balanced_result["algorithmName"] = f"{balanced_result.get('algorithmName', '优化')}（兼顾三指标/原评价）"
     result["reports"] = {
         "capacity": {**result, "run_id": run_id},
         "balanced": {**balanced_result, "run_id": run_id},
@@ -942,6 +998,154 @@ async def rename_history(run_id: str, payload: dict):
     return {"ok": True}
 
 
+def _history_report_payload(
+    run_id: str,
+    history_entry: dict,
+    summary_path: Path,
+    fallback_name: str,
+) -> dict:
+    """从某个结果目录构造历史详情 payload（供 capacity/balanced 复用）。"""
+    run_dir = summary_path.parent
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    stored_opt = history_entry.get("optimized_metrics") or summary.get("齐套感知优化", {})
+    stored_base = history_entry.get("base_metrics") or summary.get("FIFO基线", {})
+    stored_name = (
+        history_entry.get("algorithm_name")
+        or summary.get("算法名称")
+        or fallback_name
+    )
+
+    schedule = pd.read_csv(run_dir / "optimized_plate_schedule.csv")
+    groups = pd.read_csv(run_dir / "kit_groups.csv")
+    stages = pd.read_csv(run_dir / "process_stages.csv")
+
+    stored_makespan = stored_opt.get("总完工时间(h)")
+    if stored_makespan is not None and float(stored_makespan) > 0:
+        makespan_hours = float(stored_makespan)
+    else:
+        makespan_hours = float(schedule["切割完成(min)"].max()) / 60
+
+    gantt_data = []
+    for _, r in schedule.iterrows():
+        gantt_data.append({
+            "name": str(r["套料图名"]),
+            "machine": str(r["切割机"]),
+            "start": round(float(r["切割开始(min)"]) / 60, 4),
+            "end": round(float(r["切割完成(min)"]) / 60, 4),
+            "duration": round(float(r["切割工时(min)"]) / 60, 4),
+            "section": str(r.get("分段号", "")),
+            "priority": int(r.get("最低优先级", 0)),
+            "table": int(r.get("工位", 0)),
+            "tableEnd": round(float(r.get("工位完工(min)", r["切割完成(min)"])) / 60, 4),
+            "tableStart": round(float(r.get("工位开始(min)", r["切割开始(min)"])) / 60, 4),
+            "waitEnd": round(float(r.get("等待结束(min)", r["切割开始(min)"])) / 60, 4),
+        })
+
+    kit_data = []
+    for _, r in groups.iterrows():
+        kit_data.append({
+            "label": f"{r['分段号']}-P{int(r['齐套优先级'])}",
+            "partCount": int(r["零件数"]),
+            "firstArrival": round(float(r["首件到齐套区"]) / 60, 4),
+            "completion": round(float(r["齐套完成"]) / 60, 4),
+            "span": round(float(r["齐套跨度(min)"]) / 60, 4),
+        })
+
+    total_stages = float(stages["结束(min)"].max()) if len(stages) > 0 else 1.0
+    util_raw = stages.groupby("资源")["时长(min)"].sum().sort_values(ascending=False) if len(stages) > 0 else pd.Series(dtype=float)
+    util_data = []
+    for name, total_time in util_raw.items():
+        pct = round(float(total_time / total_stages * 100), 2) if total_stages > 0 else 0.0
+        util_data.append({
+            "name": str(name),
+            "totalHours": round(float(total_time) / 60, 2),
+            "utilization": pct,
+        })
+    makespan_min = float(makespan_hours) * 60
+    for mach in sorted(schedule["切割机"].unique()):
+        load_min = float(schedule[schedule["切割机"] == mach]["切割工时(min)"].sum())
+        util_data.append({
+            "name": str(mach),
+            "totalHours": round(load_min / 60, 2),
+            "utilization": round(load_min / makespan_min * 100, 2) if makespan_min > 0 else 0.0,
+        })
+
+    try:
+        comparison_df = pd.read_csv(run_dir / "comparison.csv")
+        comparison_records = json.loads(comparison_df.to_json(orient="records", force_ascii=False))
+    except Exception:
+        comparison_records = []
+
+    stages_data = []
+    part_plate_map = {}
+    try:
+        part_completion = pd.read_csv(run_dir / "part_completion.csv", encoding="utf-8-sig")
+        part_plate_map = dict(zip(
+            part_completion["零件名"].astype(str),
+            part_completion["套料图名"].astype(str),
+        ))
+    except Exception:
+        pass
+    for _, r in schedule.iterrows():
+        stages_data.append({
+            "part": str(r["套料图名"]),
+            "stage": "切割",
+            "resource": str(r["切割机"]),
+            "start": round(float(r["切割开始(min)"]) / 60, 4),
+            "end": round(float(r["切割完成(min)"]) / 60, 4),
+        })
+    for _, r in stages.iterrows():
+        stages_data.append({
+            "part": str(r.iloc[0]),
+            "stage": str(r.iloc[1]),
+            "resource": str(r.iloc[2]),
+            "start": round(float(r.iloc[3]) / 60, 4),
+            "end": round(float(r.iloc[4]) / 60, 4),
+            "plate": _resolve_stage_plate(str(r.iloc[0]), part_plate_map),
+        })
+
+    buf_ts = None
+    buf_ts_path = run_dir / "buffer_timeseries.json"
+    if buf_ts_path.exists():
+        try:
+            buf_ts = json.loads(buf_ts_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            buf_ts = None
+
+    _file_names = {
+        "schedule_csv": "optimized_plate_schedule.csv",
+        "completion_csv": "part_completion.csv",
+        "kit_csv": "kit_groups.csv",
+        "stages_csv": "process_stages.csv",
+        "comparison_csv": "comparison.csv",
+        "gantt_png": "cutting_gantt.png",
+        "kit_png": "kit_span.png",
+        "util_png": "resource_utilisation.png",
+    }
+    if run_dir.parent.name == "results":
+        files = {k: f"{run_id}/{v}" for k, v in _file_names.items()}
+    else:
+        files = {k: f"{run_id}/{run_dir.name}/{v}" for k, v in _file_names.items()}
+
+    return {
+        "run_id": run_id,
+        "algorithmName": stored_name,
+        "metrics": {
+            "fifo": stored_base,
+            "optimized": stored_opt,
+            "comparison": comparison_records,
+        },
+        "checks": {**summary.get("数据校验", {}), "工艺参数来源": summary.get("工艺参数来源", "未知")},
+        "makespanHours": round(float(makespan_hours), 2),
+        "ganttData": gantt_data,
+        "kitSpanData": kit_data,
+        "utilizationData": util_data,
+        "stagesData": stages_data,
+        "bufferTimeseries": buf_ts,
+        "files": files,
+    }
+
+
 @app.get("/api/run/{run_id}")
 async def get_run_detail(run_id: str):
     """获取某次历史运行的完整结果（用于切换查看）。"""
@@ -964,6 +1168,28 @@ async def get_run_detail(run_id: str):
         or summary.get("算法名称")
         or "SA+Tabu（线性评价）"
     )
+
+    capacity_payload = _history_report_payload(
+        run_id, history_entry, summary_path, stored_name,
+    )
+    capacity_payload["algorithmName"] = f"{capacity_payload.get('algorithmName', stored_name)}（产能优先/重工时）"
+    capacity_payload["reportMode"] = "capacity"
+    balanced_dir = run_dir / "balanced"
+    if balanced_dir.exists() and (balanced_dir / "summary.json").exists():
+        balanced_payload = _history_report_payload(
+            run_id, {}, balanced_dir / "summary.json", stored_name,
+        )
+        if "DQN" in (balanced_payload.get("algorithmName", stored_name) or stored_name):
+            balanced_payload["algorithmName"] = f"{balanced_payload.get('algorithmName', stored_name)}（兼顾三指标/Pareto综合选解）"
+        else:
+            balanced_payload["algorithmName"] = f"{balanced_payload.get('algorithmName', stored_name)}（兼顾三指标/原评价）"
+        balanced_payload["reportMode"] = "balanced"
+        capacity_report = dict(capacity_payload)
+        capacity_payload["reports"] = {
+            "capacity": capacity_report,
+            "balanced": balanced_payload,
+        }
+    return capacity_payload
 
     # 重算图表数据
     try:

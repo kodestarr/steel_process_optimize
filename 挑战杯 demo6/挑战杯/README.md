@@ -28,8 +28,20 @@
 - N2/N5 两台切割机的钢板分配与排序
 - 小件自动工序、大件人工工序、AGV 转运和有限成品缓存的离散事件仿真
 - FIFO 基线 + 齐套感知局部搜索优化
+- 进化算法可选 `SA+Tabu`、`GA+LNS`、`DQN+NSGA-II`；后两者共用现有仿真评估
+- `DQN+NSGA-II` 为多目标 Pareto 搜索，单次运行输出“重工时”和“兼顾三指标”两套交付解
 - 附件3 厚度相关切割速度表自动查表 + 线性插值
 - 优化目标：`0.48×Cmax + 0.37×平均齐套跨度 + 0.15×切割负载差`
+
+### DQN 模型离线训练（可选）
+
+网页运行时如果没有 `dqn_machine_model.pt`，会自动退回启发式机器码种子。需要训练真实 DQN 时：
+
+```powershell
+python train_dqn_nsga2.py --output dqn_machine_model.pt
+```
+
+脚本默认使用 `D:\作文\学校\项目\2026擂台赛\产线场景描述\附件2：钢板零件数据.xlsx` 和 `附件3：工艺用时计算表.xlsx`；如果文件在其他位置，可用 `--plate-file` 与 `--speed-file` 指定。训练环境需要 PyTorch CPU，可执行 `pip install -r backend/requirements-dqn.txt`。
 
 ## 一键运行
 - 点击start.bat
