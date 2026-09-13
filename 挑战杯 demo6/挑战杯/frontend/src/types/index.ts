@@ -12,6 +12,11 @@ export interface UploadResponse {
   };
   speed_table_uploaded: boolean;
   speed_sheet_count: number;
+  safety_caps?: {
+    plate_count: number;
+    sa_ga_hours: number;
+    nsga_hours: number;
+  };
 }
 
 // ── 参数 ──
@@ -48,6 +53,8 @@ export interface ModelParams {
   random_seed: number;
   optimizer_method: string;  // 'sa_tabu' | 'ga_lns' | 'dq_nsga2'
   objective_type: string;    // 'linear' | 'quadratic' | 'auto'
+  max_compute_time_s: number; // 用户可接受的最大计算时间（秒）
+  time_priority_mode: number; // 1=时间优先，自动匹配模型参数；0=完全按模型参数运行
   ga_population_size: number;
   ga_generations: number;
   ga_crossover_rate: number;
@@ -119,18 +126,6 @@ export interface ComparisonRow {
   [key: string]: string | number;
 }
 
-export interface BufferTimeseriesEntry {
-  time_h: number;
-  [key: string]: number;  // "N2_码垛占用", "N5_码垛占用", "坡口缓存占用", "齐套缓存占用", ...
-}
-
-export interface BufferCapacityConfig {
-  machine_caps: Record<string, number>;  // {"N2": 10, "N5": 18, ...}
-  bevel_capacity: number;
-  half_capacity: number;
-  kit_capacity: number;
-}
-
 export interface RunResponse {
   run_id: string;
   reportMode?: 'capacity' | 'balanced';
@@ -145,9 +140,8 @@ export interface RunResponse {
   kitSpanData: KitSpanItem[];
   utilizationData: UtilItem[];
   stagesData: StageItem[];
-  bufferTimeseries?: BufferTimeseriesEntry[];
-  bufferConfig?: BufferCapacityConfig;  // 后端返回的真实缓存区容量配置
   checks: Record<string, string | number | boolean>;
+  optimizerFallbackReason?: string;
   files: {
     schedule_csv: string;
     completion_csv: string;

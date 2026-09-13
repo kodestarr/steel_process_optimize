@@ -11,6 +11,7 @@ import {
   Tag,
   Select,
   Tooltip,
+  Switch,
 } from 'antd';
 import type { ModelParams, UploadResponse } from '../types';
 import {
@@ -62,6 +63,8 @@ export const DEFAULT_PARAMS: ModelParams = {
   random_seed: 20260723,
   optimizer_method: 'sa_tabu',
   objective_type: 'linear',
+  max_compute_time_s: 300,
+  time_priority_mode: 1,
   ga_population_size: 16,
   ga_generations: 10,
   ga_crossover_rate: 0.85,
@@ -149,6 +152,9 @@ const ParamConfig: React.FC<Props> = ({ params, onChange, upload }) => {
   };
 
   const resetAll = () => onChange({ ...DEFAULT_PARAMS });
+  const safetyCaps = upload?.safety_caps;
+  const saGaCapText = safetyCaps ? `${safetyCaps.sa_ga_hours}h` : '上传附件2后按钢板数计算';
+  const nsgaCapText = safetyCaps ? `${safetyCaps.nsga_hours}h` : '上传附件2后按钢板数计算';
 
   return (
     <div style={{ maxWidth: 900, margin: '0 auto' }}>
@@ -335,6 +341,59 @@ const ParamConfig: React.FC<Props> = ({ params, onChange, upload }) => {
                   </Col>
                 </Row>
                 <ParamRow label="搜索迭代次数" tooltip="局部搜索迭代次数，越大越精细但越慢" value={params.local_search_iterations} min={50} max={1000} step={10} unit="次" onChange={(v) => set('local_search_iterations', v)} />
+                <Row align="middle" style={{ marginBottom: 12 }}>
+                  <Col span={8}>
+                    <Text style={{ fontSize: 13 }}>最大计算时间</Text>
+                    <Tooltip title="不设输入上限。实际优化预算 = 该时间 × 0.95；达到预算后会在当前迭代/代结束后停止，不会中途打断一次评估。系统还会根据附件2钢板数设置内部安全上限。">
+                      <QuestionCircleOutlined style={{ marginLeft: 4, color: '#94A3B8', cursor: 'help', fontSize: 13 }} />
+                    </Tooltip>
+                  </Col>
+                  <Col span={16}>
+                    <InputNumber
+                      size="small"
+                      min={1}
+                      step={10}
+                      value={params.max_compute_time_s}
+                      onChange={(v) => v !== null && set('max_compute_time_s', v)}
+                      addonAfter="s"
+                      style={{ width: '100%' }}
+                    />
+                  </Col>
+                </Row>
+                <div style={{ margin: '-4px 0 12px 8px' }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    内部安全上限：SA/GA 最长 {saGaCapText}，DQN+NSGA-II 最长 {nsgaCapText}
+                    {safetyCaps ? `（按附件2钢板数 ${safetyCaps.plate_count} 张动态计算）` : ''}
+                  </Text>
+                </div>
+                <Row align="middle" style={{ marginBottom: 12 }}>
+                  <Col span={8}>
+                    <Text style={{ fontSize: 13 }}>时间优先模式</Text>
+                    <Tooltip title="开启后，当时间与模型参数冲突时以时间为准：系统会自动放大迭代次数、种群规模或代数上限，尽量把 95% 的时间预算用完。关闭后完全按当前模型参数运行，不再受该时间限制。">
+                      <QuestionCircleOutlined style={{ marginLeft: 4, color: '#94A3B8', cursor: 'help', fontSize: 13 }} />
+                    </Tooltip>
+                  </Col>
+                  <Col span={16}>
+                    <Switch
+                      checked={params.time_priority_mode === 1}
+                      onChange={(checked) => set('time_priority_mode', checked ? 1 : 0)}
+                    />
+                  </Col>
+                </Row>
+                {optimizerMethod(params) === 'dq_nsga2' && params.max_compute_time_s < 10 && (
+                  <div style={{ margin: '-4px 0 12px 8px' }}>
+                    <Text type="warning" style={{ fontSize: 12 }}>
+                      最大计算时间低于 10s：运行时会自动改用 SA+Tabu 方案，DQN+NSGA-II 不会启动。
+                    </Text>
+                  </div>
+                )}
+                {params.time_priority_mode !== 1 && (
+                  <div style={{ margin: '-4px 0 12px 8px' }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      时间优先已关闭：将忽略“最大计算时间”，完全按当前模型参数运行（可能超时，也可能提前结束）。
+                    </Text>
+                  </div>
+                )}
                 <ParamRow label="随机种子" value={params.random_seed} min={1} max={99999999} step={1} onChange={(v) => set('random_seed', v)} />
                 {params.optimizer_method === 'ga_lns' && (
                   <>

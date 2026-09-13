@@ -31,7 +31,9 @@ from improved_optimizer import SATabuOptimizer
 from steel_schedule_model import (
     ModelConfig,
     ProcessParams,
+    auto_generation_cap,
     build_crane_aware_orders,
+    compute_time_budget_seconds,
     legacy_balanced_objective,
     machine_names,
     select_best_by_track,
@@ -448,16 +450,20 @@ class DqnNsga2Optimizer(SATabuOptimizer):
         max_iterations: int = 260,
         time_limit_seconds: float = float("inf"),
         progress_callback: object = None,
+        generation_cap: int | None = None,
     ) -> tuple[dict, dict, list[dict], str]:
         t0 = time.time()
         pop_size = max(4, int(getattr(self.cfg, "ga_population_size", 16)))
-        generations = max(
-            1,
-            min(
-                int(getattr(self.cfg, "ga_generations", 10)),
-                max(1, int(max_iterations / max(1, pop_size // 2))),
-            ),
-        )
+        if generation_cap is None:
+            generations = max(
+                1,
+                min(
+                    int(getattr(self.cfg, "ga_generations", 10)),
+                    max(1, int(max_iterations / max(1, pop_size // 2))),
+                ),
+            )
+        else:
+            generations = max(1, int(generation_cap))
         self._pool = None
         if self.parallel_workers > 1 and mp.current_process().name == "MainProcess":
             ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
@@ -469,6 +475,8 @@ class DqnNsga2Optimizer(SATabuOptimizer):
 
         total_evals = 0
         best_cap_obj = math.inf
+        completed_generations = 0
+        time_limit_reached = False
         try:
             raw_pop = self._build_initial_population(initial_order)
             population = self._evaluate_many(raw_pop)
@@ -476,12 +484,14 @@ class DqnNsga2Optimizer(SATabuOptimizer):
             self._assign_rank_crowd(population)
             for gen in range(generations):
                 if time.time() - t0 > time_limit_seconds:
+                    time_limit_reached = True
                     break
                 offspring = self._generate_offspring(population, gen)
                 offspring = self._evaluate_many(offspring)
                 total_evals += len(offspring)
                 merged = population + offspring
                 population = self._probabilistic_next(merged, gen, generations)
+                completed_generations += 1
                 if progress_callback:
                     caps = [
                         unified_capacity_objective(
@@ -516,8 +526,9 @@ class DqnNsga2Optimizer(SATabuOptimizer):
         balanced = self._select_record(front, "balanced")
         elapsed = time.time() - t0
         stats = (
-            f"DQN+NSGA-II: {generations} gens, {total_evals} evals, "
-            f"{len(front)} front, {elapsed:.1f}s"
+            f"DQN+NSGA-II: {completed_generations}/{generations} gens, {total_evals} evals, "
+            f"{len(front)} front, {elapsed:.1f}s, "
+            f"{'time_limit' if time_limit_reached else 'completed'}"
         )
         return capacity, balanced, front, stats
 
@@ -559,6 +570,7 @@ def run_dq_nsga2_pareto_front(
     iterations: int = 260,
     progress_callback: object = None,
     parallel_workers: int | None = None,
+    time_limit_seconds: float | None = None,
 ) -> dict:
     """Run one Pareto search and return both capacity/balanced delivery results."""
     name_col = next(c for c in features.columns if "套料图名" in c or "plate" in c.lower())
@@ -577,7 +589,11 @@ def run_dq_nsga2_pareto_front(
 
     if parallel_workers is None:
         env = os.environ.get("OPTIMIZER_PARALLEL", "1").strip().lower()
-        parallel_workers = 1 if env in ("0", "false", "no", "off") else min(os.cpu_count() or 1, 8)
+        parallel_workers = (
+            1
+            if env in ("0", "false", "no", "off")
+            else min(os.cpu_count() or 1, max(4, int(getattr(cfg, "ga_population_size", 16))))
+        )
     if mp.current_process().name != "MainProcess":
         parallel_workers = 1
     parallel_workers = max(1, int(parallel_workers or 1))
@@ -599,12 +615,21 @@ def run_dq_nsga2_pareto_front(
     opt.fifo_load = base_metrics["切割负载差(h)"]
     opt.fifo_waiting = base_metrics.get("总等待时间(h)", 0.0)
     opt.fifo_met = base_metrics
+    if time_limit_seconds is None:
+        time_limit_seconds = compute_time_budget_seconds(cfg)
+    time_limit_seconds = max(0.1, float(time_limit_seconds))
 
     capacity_rec, balanced_rec, front, stats = opt.optimize(
         fifo_order,
         max_iterations=iterations,
-        time_limit_seconds=float("inf"),
+        time_limit_seconds=time_limit_seconds,
         progress_callback=progress_callback,
+        generation_cap=auto_generation_cap(
+            cfg,
+            int(getattr(cfg, "ga_generations", 10)),
+            time_limit_seconds,
+            seconds_per_generation=2.5,
+        ),
     )
     if capacity_rec is None or balanced_rec is None:
         raise RuntimeError("DQN+NSGA-II 未产生 Pareto 前沿解")
@@ -625,6 +650,7 @@ def run_dq_nsga2_pareto_front(
         "base_schedule": base_schedule,
         "base_metrics": base_metrics,
         "base_stages": base_stages,
+        "stats": stats,
         "capacity": {
             "schedule": cap_schedule,
             "metrics": cap_metrics,

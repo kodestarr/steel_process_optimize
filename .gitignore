@@ -39,11 +39,14 @@ backend/history.json.lock
 **/backend/history.json.lock
 backend/history.json
 **/backend/history.json
+**/backend/tmp*/
+**/backend/*.tmp
 frontend/dist/
 **/frontend/dist/
 report_render/
 **/report_render/
 *.zip
+*.tmp
 drl_qtable.npy
 **/drl_qtable.npy
 *.npy

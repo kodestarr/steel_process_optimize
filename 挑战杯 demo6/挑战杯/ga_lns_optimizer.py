@@ -26,7 +26,9 @@ from improved_optimizer import SATabuOptimizer  # noqa: E402
 from pareto_optimizer import _build_init_orders  # noqa: E402
 from steel_schedule_model import (  # noqa: E402
     ModelConfig,
+    auto_generation_cap,
     build_crane_aware_orders,
+    compute_time_budget_seconds,
     unified_capacity_objective,
     select_best_by_capacity,
     legacy_balanced_objective,
@@ -419,16 +421,20 @@ class GeneticLNSOptimizer(SATabuOptimizer):
         time_limit_seconds: float = 300.0,
         verbose: bool = False,
         progress_callback: object = None,
+        generation_cap: int | None = None,
     ) -> tuple[list[str], dict, str]:
         t0 = time.time()
         pop_size = max(4, int(getattr(self.cfg, "ga_population_size", 16)))
-        generations = max(
-            1,
-            min(
-                int(getattr(self.cfg, "ga_generations", 10)),
-                max(1, int(max_iterations / max(1, pop_size // 2))),
-            ),
-        )
+        if generation_cap is None:
+            generations = max(
+                1,
+                min(
+                    int(getattr(self.cfg, "ga_generations", 10)),
+                    max(1, int(max_iterations / max(1, pop_size // 2))),
+                ),
+            )
+        else:
+            generations = max(1, int(generation_cap))
 
         self._pool = None
         if self.parallel_workers > 1 and mp.current_process().name == "MainProcess":
@@ -450,6 +456,8 @@ class GeneticLNSOptimizer(SATabuOptimizer):
             )
 
         total_evals = 0
+        completed_generations = 0
+        time_limit_reached = False
         try:
             population = self._build_initial_population(initial_order)
             population = self._evaluate_many(population)
@@ -459,6 +467,7 @@ class GeneticLNSOptimizer(SATabuOptimizer):
 
             for gen in range(generations):
                 if time.time() - t0 > time_limit_seconds:
+                    time_limit_reached = True
                     break
                 offspring = self._generate_offspring(population, gen)
                 total_evals += len(offspring)
@@ -480,6 +489,7 @@ class GeneticLNSOptimizer(SATabuOptimizer):
                         self._update_pareto_archive(new_order[:], new_met)
                 population.sort(key=lambda x: x[2])
                 population = population[:pop_size]
+                completed_generations += 1
 
                 if population[0][2] < best_obj - 1e-9:
                     best_order, best_met, best_obj = population[0]
@@ -498,7 +508,8 @@ class GeneticLNSOptimizer(SATabuOptimizer):
         final_order, final_met = self._select_final(best_order, best_met)
         elapsed = time.time() - t0
         stats = (
-            f"GA+LNS: {generations} gens, {total_evals} evals, {elapsed:.1f}s | "
+            f"GA+LNS: {completed_generations}/{generations} gens, {total_evals} evals, {elapsed:.1f}s, "
+            f"{'time_limit' if time_limit_reached else 'completed'} | "
             f"Cmax: {best_met['总完工时间(h)']:.2f}h -> {final_met['总完工时间(h)']:.2f}h, "
             f"KitSpan: {best_met['加权平均齐套跨度(h)']:.2f}h -> {final_met['加权平均齐套跨度(h)']:.2f}h"
         )
@@ -537,6 +548,7 @@ def run_ga_lns_optimization(
     progress_callback: object = None,
     parallel_workers: int | None = None,
     objective_type: str = "linear",
+    time_budget_seconds: float | None = None,
 ) -> dict:
     """GA+LNS 入口，返回结构与 run_multi_strategy_inline 一致。"""
     name_col = next(c for c in features.columns if "套料图名" in c or "plate" in c.lower())
@@ -557,7 +569,11 @@ def run_ga_lns_optimization(
 
     if parallel_workers is None:
         env = os.environ.get("OPTIMIZER_PARALLEL", "1").strip().lower()
-        parallel_workers = 1 if env in ("0", "false", "no", "off") else min(os.cpu_count() or 1, 8)
+        parallel_workers = (
+            1
+            if env in ("0", "false", "no", "off")
+            else min(os.cpu_count() or 1, max(4, int(getattr(cfg, "ga_population_size", 16))))
+        )
     if mp.current_process().name != "MainProcess":
         parallel_workers = 1
     parallel_workers = max(1, int(parallel_workers or 1))
@@ -585,9 +601,10 @@ def run_ga_lns_optimization(
     opt.fifo_load_diff = fifo_load
     opt.fifo_waiting = fifo_waiting
 
-    # GA 按固定代数/固定评估次数运行，避免机器负载导致提前截断、结果不可复现。
-    # 如需强制限制运行时间，可在 optimize() 里单独传入更小的 time_limit_seconds。
-    time_limit = float("inf")
+    # 时间预算按“最大计算时间 × 0.95”执行；仅在每代开始处检查，保证当前代完整结束。
+    if time_budget_seconds is None:
+        time_budget_seconds = compute_time_budget_seconds(cfg)
+    time_limit = max(0.1, float(time_budget_seconds))
 
     def _wrap_cb(it, mx, cur, best, T):
         if progress_callback:
@@ -599,6 +616,12 @@ def run_ga_lns_optimization(
         time_limit_seconds=time_limit,
         verbose=False,
         progress_callback=_wrap_cb if progress_callback else None,
+        generation_cap=auto_generation_cap(
+            cfg,
+            int(getattr(cfg, "ga_generations", 10)),
+            time_limit,
+            seconds_per_generation=1.0,
+        ),
     )
 
     opt_schedule, opt_metrics, opt_stages = builder.schedule_from_order(order)
@@ -612,6 +635,7 @@ def run_ga_lns_optimization(
         "opt_metrics": opt_metrics,
         "stages": opt_stages,
         "strategy_name": "GA+LNS",
+        "stats": stats,
     }
 
 

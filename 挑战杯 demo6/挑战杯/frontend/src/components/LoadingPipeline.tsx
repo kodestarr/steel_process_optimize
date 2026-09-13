@@ -1,4 +1,6 @@
 import React, { useEffect, useState } from 'react';
+import { Button } from 'antd';
+import { StopOutlined } from '@ant-design/icons';
 import './LoadingPipeline.css';
 
 const stages = [
@@ -10,13 +12,11 @@ const stages = [
 
 interface Props {
   visible: boolean;
-  progress?: { elapsed: number; stage: string } | null;
+  onCancel?: () => void;
 }
 
-const LoadingPipeline: React.FC<Props> = ({ visible, progress }) => {
+const LoadingPipeline: React.FC<Props> = ({ visible, onCancel }) => {
   const [step, setStep] = useState(0);
-  const elapsed = progress?.elapsed ?? 0;
-  const stageLabel = progress?.stage ?? '';
 
   // P0-9 FIX: Decouple stage cycling from progress updates.
   // Previously, `progress` changed every 2s, which cleared the 3s setInterval
@@ -50,8 +50,7 @@ const LoadingPipeline: React.FC<Props> = ({ visible, progress }) => {
         {/* 标题 */}
         <div className="loading-title">模型计算中</div>
         <div className="loading-subtitle">
-          {stageLabel || '正在为您优化钢板排产方案'}
-          <span style={{ marginLeft: 8, opacity: 0.7 }}>已运行 {elapsed.toFixed(1)}s</span>
+          正在为您优化钢板排产方案
         </div>
 
         {/* 进度条 */}
@@ -77,6 +76,16 @@ const LoadingPipeline: React.FC<Props> = ({ visible, progress }) => {
             </div>
           ))}
         </div>
+        {onCancel && (
+          <Button
+            danger
+            icon={<StopOutlined />}
+            onClick={onCancel}
+            style={{ marginTop: 18 }}
+          >
+            紧急中断
+          </Button>
+        )}
       </div>
     </div>
   );

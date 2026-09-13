@@ -31,6 +31,8 @@ from steel_schedule_model import (
     ModelConfig, ProcessParams, load_and_validate, load_process_params,
     plate_features, make_greedy_schedule, simulate, objective, pick_machine,
     build_joint_schedule, build_crane_aware_orders,
+    compute_time_budget_seconds,
+    auto_iteration_cap,
     CranePool, _reserve_raw_material_crane,
     unified_capacity_objective, select_best_by_capacity,
     legacy_balanced_objective, select_best_by_track,
@@ -656,6 +658,9 @@ class SATabuOptimizer:
                 _focused_kit = seed_met["加权平均齐套跨度(h)"]
                 _improved = 0
                 for _fi in range(int(getattr(self, "_focused_descent_iterations", 150))):
+                    # 时间预算只在一次邻域评估开始前检查，保证当前评估完整结束。
+                    if time.time() - t0 > time_limit_seconds:
+                        break
                     # Early: more Cmax-reducing operators; later: more KitSpan-reducing
                     if _fi < 50:
                         _op_choice = self.rng.choice(['kit_cluster', 'stagger_crane', 'cross_rebalance', 'swap', 'insert'])
@@ -849,6 +854,7 @@ def run_multi_strategy_inline(
     iterations: int = 260,
     progress_callback: object = None,
     parallel_workers: int | None = None,
+    time_budget_seconds: float | None = None,
 ) -> dict:
     """
     Multi-start SA+Tabu optimization called by the FastAPI backend.
@@ -953,7 +959,9 @@ def run_multi_strategy_inline(
 
     # ── Run SA+Tabu from each initial solution ──
     iter_per_start = max(80, iterations // len(init_solutions))
-    time_per_start = max(30, 120 // len(init_solutions))
+    if time_budget_seconds is None:
+        time_budget_seconds = compute_time_budget_seconds(cfg)
+    time_budget_seconds = max(0.1, float(time_budget_seconds))
 
     # ── Cross-start Pareto selection (Loop 2) ──
     # Each start returns its Pareto-optimal solution. Collect all and select
@@ -972,10 +980,17 @@ def run_multi_strategy_inline(
     if mp.current_process().name != "MainProcess":
         parallel_workers = 1  # 防止在已有 worker 进程内再次嵌套进程池
     parallel_workers = max(1, min(int(parallel_workers or 1), total_starts))
+    # 总预算按并行批次数分摊到每个起点，尽量用满预算但不超出。
+    time_per_start = max(0.1, time_budget_seconds * parallel_workers / max(1, total_starts))
+    iter_per_start = auto_iteration_cap(cfg, iter_per_start, time_per_start)
 
     if parallel_workers <= 1:
         # 串行路径：保留原有进度回调逻辑
+        budget_t0 = time.time()
         for start_idx, (name, init_order) in enumerate(init_solutions.items()):
+            # 预算已用尽则不再启动新的起点；已经启动的搜索会完整跑完。
+            if start_idx > 0 and time.time() - budget_t0 > time_budget_seconds:
+                break
             # P1-5 修复：使用确定性 MD5 替代非确定性 Python hash()
             _name_hash = int(hashlib.md5(name.encode('utf-8')).hexdigest(), 16) % 100000
             opt = SATabuOptimizer(features, parts, cfg, pp, seed=cfg.random_seed + _name_hash)
@@ -1106,6 +1121,7 @@ def run_multi_strategy_inline(
         "opt_metrics": opt_metrics,
         "stages": opt_stages,
         "strategy_name": best_name,
+        "stats": "\n".join(all_stats),
     }
 
 

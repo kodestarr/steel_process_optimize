@@ -116,9 +116,9 @@ Two objective functions exist:
 
 ## Frontend Structure
 
-`App.tsx` manages state: `upload`, `params` (from ParamConfig DEFAULT_PARAMS), `result`, `activeRunId`. Tab-based layout: DataImport → ParamConfig → ResultOverview → GanttChart → KitAnalysis → UtilCharts → KitDashboard → BufferMonitor → ReschedulePanel → ModelArchitecture → LoadingPipeline. HistorySidebar in left drawer. All charts use ECharts via echarts-for-react.
+`App.tsx` manages state: `upload`, `params` (from ParamConfig DEFAULT_PARAMS), `result`, `activeRunId`. Tab-based layout: DataImport → ParamConfig → ResultOverview → GanttChart → KitAnalysis → UtilCharts → ReschedulePanel → ModelArchitecture → LoadingPipeline. HistorySidebar in left drawer. All charts use ECharts via echarts-for-react.
 
-API client (`api/index.ts`): axios with baseURL `/api`, infinite timeout. Progress polling at `fetchProgress`.
+API client (`api/index.ts`): axios with baseURL `/api`, infinite timeout.
 
 After editing frontend source, run `npm run build` and restart backend to serve updated `dist/`.
 

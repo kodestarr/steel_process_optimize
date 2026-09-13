@@ -1,5 +1,5 @@
 import React from 'react';
-import { Card, Statistic, Row, Col, Table, Tag, Typography, Space } from 'antd';
+import { Alert, Card, Statistic, Row, Col, Table, Tag, Typography, Space } from 'antd';
 import {
   ClockCircleOutlined,
   FieldTimeOutlined,
@@ -106,6 +106,15 @@ const ResultOverview: React.FC<Props> = ({ data, prevData }) => {
           <Text type="secondary" style={{ fontSize: FONT.sizeSm }}>{objectiveText}</Text>
         </Space>
       </div>
+
+      {data.optimizerFallbackReason && (
+        <Alert
+          type="warning"
+          showIcon
+          message={data.optimizerFallbackReason}
+          style={{ marginBottom: 16 }}
+        />
+      )}
 
       {/* OEE定义说明（P1-1: 清晰展示两种OEE口径） */}
       <Card size="small" style={{ marginBottom: 16, background: '#F0F7FF', border: '1px solid #BAE0FF' }}>

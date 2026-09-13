@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import copy
 import math
 import os
 import subprocess
 import sys
+import threading
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,10 +20,13 @@ import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 # 允许从项目根目录导入现有模型
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from result_store import ResultStore
 
 # ── P0-4/P0-5 FIX: NaN/Inf sanitizer for JSON-safe serialization ──
 def _sanitize_json(obj):
@@ -55,17 +61,22 @@ def _safe_result_path(run_id: str, filename: str | None = None) -> Path:
     if safe_id in (".", ".."):
         raise HTTPException(403, "非法运行ID")
 
+    run_root = RESULT_DIR / safe_id
     if filename is not None:
         rel = Path(filename.replace("\\", "/"))
-        if rel.is_absolute() or ".." in rel.parts or len(rel.parts) > 2:
+        if rel.is_absolute() or ".." in rel.parts or len(rel.parts) > 4:
             raise HTTPException(403, "非法文件名")
-        resolved = (RESULT_DIR / safe_id / rel).resolve()
+        if rel.parts and rel.parts[0] in {ResultStore.STAGING, ResultStore.GENERATIONS, ResultStore.CURRENT}:
+            base = run_root
+        else:
+            base = ResultStore(RESULT_DIR, safe_id).active_dir() if run_root.exists() else run_root
+        resolved = (base / rel).resolve()
     else:
-        resolved = (RESULT_DIR / safe_id).resolve()
+        resolved = run_root.resolve()
 
     # Ensure resolved path is inside RESULT_DIR
     try:
-        resolved.relative_to(RESULT_DIR.resolve())
+        resolved.relative_to(run_root.resolve())
     except ValueError:
         raise HTTPException(403, "路径越权")
 
@@ -74,7 +85,9 @@ def _safe_result_path(run_id: str, filename: str | None = None) -> Path:
 from steel_schedule_model import (  # noqa: E402
     ModelConfig,
     ProcessParams,
-    load_and_validate,
+    compute_time_budget_seconds,
+    compute_safety_time_caps,
+    load_and_validate_fast,
     load_process_params,
     make_greedy_schedule,
     machine_names,
@@ -87,6 +100,7 @@ from steel_schedule_model import (  # noqa: E402
     simulate,
     build_joint_schedule,
     objective,
+    resolve_optimizer_method,
 )
 
 from improved_optimizer import run_multi_strategy_inline  # noqa: E402
@@ -94,6 +108,7 @@ from drl_optimizer import run_drl_enhanced_optimization  # noqa: E402
 from pareto_optimizer import run_quadratic_optimization  # noqa: E402
 from ga_lns_optimizer import run_ga_lns_optimization  # noqa: E402
 from dqn_nsga2_optimizer import run_dq_nsga2_pareto_front  # noqa: E402
+from dynamic_rescheduler import DynamicRescheduleService  # noqa: E402
 
 # ── 目录 ──────────────────────────────────────────────
 UPLOAD_DIR = Path(__file__).parent / "uploads"
@@ -102,10 +117,16 @@ HISTORY_FILE = Path(__file__).parent / "history.json"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── 优化进度共享状态（线程安全）──
-import threading
-_optimization_progress: dict[str, dict] = {}
-_progress_lock = threading.Lock()
+_dynamic_jobs: dict[str, dict] = {}
+_dynamic_job_lock = threading.Lock()
+_dynamic_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dynamic-reschedule")
+_run_cancel_flags: set[str] = set()
+_run_cancel_lock = threading.Lock()
+_run_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="model-run")
+
+
+class CalculationCancelled(Exception):
+    pass
 
 # ── 跨平台文件锁（P0-1: 防止多 worker 下 history.json 并发写损坏）──
 import os as _os
@@ -284,9 +305,9 @@ def _run_model(
     checks: dict,
     speed_table_path: str | None = None,
     eval_track: str = "capacity",
-    progress_tag: str | None = None,
-    manage_progress: bool = True,
     pareto_front_store: dict | None = None,
+    cancel_token: str | None = None,
+    parallel_workers: int | None = None,
 ):
     """运行完整建模管线，将结果写入 out_dir 并返回结构化数据。"""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -304,23 +325,31 @@ def _run_model(
     cfg = cfg.adapt_to_data(plates, parts, pp)
     features = plate_features(plates, parts, cfg, speed_table)
 
-    # ── 进度回调 ──
-    run_tag = progress_tag or out_dir.name  # run_id
-    def _progress_cb(iteration: int, max_iter: int, current_obj: float, best_obj: float, temp: float):
-        with _progress_lock:
-            _optimization_progress[run_tag] = {
-                "iteration": iteration, "max_iterations": max_iter,
-                "current_obj": round(current_obj, 4), "best_obj": round(best_obj, 4),
-                "temperature": round(temp, 4),
-                "progress_pct": round(100.0 * iteration / max(max_iter, 1), 1),
-            }
+    def _check_cancelled(*_args, **_kwargs):
+        if not cancel_token:
+            return
+        with _run_cancel_lock:
+            if cancel_token in _run_cancel_flags:
+                raise CalculationCancelled("用户已紧急中断计算")
+
+    _check_cancelled()
 
     # ── 多策略优化（高迭代数时启用DRL增强）──
-    method = getattr(cfg, "optimizer_method", "sa_tabu")
+    requested_method = getattr(cfg, "optimizer_method", "sa_tabu")
     objective_type = getattr(cfg, "objective_type", "linear")
-    if method == "quadratic":  # 旧版兼容
+    time_budget_s = compute_time_budget_seconds(cfg)
+    fallback_reason = ""
+    if requested_method == "quadratic":  # 旧版兼容
         method = "sa_tabu"
         objective_type = "quadratic"
+    else:
+        method = resolve_optimizer_method(cfg)
+    if requested_method == "dq_nsga2" and method == "sa_tabu":
+        fallback_reason = "最大计算时间低于10秒，已自动改用SA+Tabu方案"
+        cfg.optimizer_method = "sa_tabu"
+        if objective_type == "auto":
+            objective_type = "linear"
+            cfg.objective_type = "linear"
     use_drl = (
         cfg.local_search_iterations >= 400
         and method == "sa_tabu"
@@ -334,7 +363,9 @@ def _run_model(
             front_result = run_dq_nsga2_pareto_front(
                 plates, parts, features, cfg, pp, speed_table, checks,
                 iterations=cfg.local_search_iterations,
-                progress_callback=_progress_cb,
+                progress_callback=_check_cancelled,
+                time_limit_seconds=time_budget_s,
+                parallel_workers=parallel_workers,
             )
             if pareto_front_store is not None:
                 pareto_front_store.clear()
@@ -352,64 +383,47 @@ def _run_model(
         opt_result = run_ga_lns_optimization(
             plates, parts, features, cfg, pp, speed_table, checks,
             iterations=cfg.local_search_iterations,
-            progress_callback=_progress_cb,
             objective_type=objective_type,
+            progress_callback=_check_cancelled,
+            time_budget_seconds=time_budget_s,
+            parallel_workers=parallel_workers,
         )
     elif objective_type == "quadratic":
         opt_result = run_quadratic_optimization(
             plates, parts, features, cfg, pp, speed_table, checks,
             iterations=cfg.local_search_iterations,
-            progress_callback=_progress_cb,
+            progress_callback=_check_cancelled,
+            time_budget_seconds=time_budget_s,
+            parallel_workers=parallel_workers,
         )
     elif use_drl:
         opt_result = run_drl_enhanced_optimization(
             plates, parts, features, cfg, pp, speed_table, checks,
             iterations=cfg.local_search_iterations, training=True,
+            time_budget_seconds=time_budget_s,
+            parallel_workers=parallel_workers,
         )
     else:
         opt_result = run_multi_strategy_inline(
             plates, parts, features, cfg, pp, speed_table, checks,
             iterations=cfg.local_search_iterations,
-            progress_callback=_progress_cb,
+            progress_callback=_check_cancelled,
+            time_budget_seconds=time_budget_s,
+            parallel_workers=parallel_workers,
         )
-    # 清理进度状态
-    if manage_progress:
-        with _progress_lock:
-            _optimization_progress.pop(run_tag, None)
     schedule = opt_result["schedule"]
     base_schedule = opt_result["base_schedule"]
     base_metrics = opt_result["base_metrics"]
     opt_metrics = opt_result["opt_metrics"]
     stages = opt_result["stages"]
 
-    # P1-1/P1-3: 第二次 simulate() 返回完整 metrics（含 buffer/死锁/AGV/资源利用率），
-    # 用于丰富 summary.json 和保证前后端数据一致性。
-    # simulate 返回顺序: (complete_df, groups_df, metrics_dict, stages_df, buffer_timeseries)
-    complete, groups, full_opt_metrics, _, buf_ts = simulate(schedule, parts, cfg, pp)
+    # 第二次 simulate() 返回完整 metrics，用于丰富 summary.json。
+    complete, groups, full_opt_metrics, _, _ = simulate(schedule, parts, cfg, pp)
     _, base_groups, full_base_metrics, _, _ = simulate(base_schedule, parts, cfg, pp)
 
     # 合并：以 optimizer 返回的 KPI 为准，补充 simulate 的详细诊断指标
     base_metrics = {**full_base_metrics, **base_metrics}
     opt_metrics = {**full_opt_metrics, **opt_metrics}
-
-    # ── P1-3: 统一引用 ModelConfig.PER_MACHINE_CAPS（消除重复定义）──
-    all_machines = list(schedule["切割机"].unique())
-    per_machine_caps = getattr(cfg, 'PER_MACHINE_CAPS', {"N2": 10, "N5": 18})
-    _caps_map: dict[str, int] = {}
-    _remaining_cap = max(0, cfg.finish_buffer_capacity - sum(
-        per_machine_caps.get(m, 0) for m in all_machines if m in per_machine_caps))
-    _unassigned = [m for m in all_machines if m not in per_machine_caps]
-    for m in all_machines:
-        if m in per_machine_caps:
-            _caps_map[m] = per_machine_caps[m]
-        else:
-            _caps_map[m] = max(1, _remaining_cap // max(1, len(_unassigned)))
-    buffer_config = {
-        "machine_caps": _caps_map,
-        "bevel_capacity": cfg.bevel_buffer_capacity,
-        "half_capacity": cfg.half_buffer_capacity,
-        "kit_capacity": cfg.kit_buffer_capacity,
-    }
 
     # 对比
     comparison_rows = [
@@ -478,6 +492,13 @@ def _run_model(
             "local_search_iterations": cfg.local_search_iterations,
             "random_seed": cfg.random_seed,
             "optimizer_method": cfg.optimizer_method,
+            "max_compute_time_s": cfg.max_compute_time_s,
+            "time_priority_mode": cfg.time_priority_mode,
+            "钢板数": cfg.plate_count,
+            "安全上限(s)": round(float(getattr(cfg, "safety_time_cap_s", 0.0) or 0.0), 2),
+            "实际计算预算(s)": round(time_budget_s, 2),
+            "优化降级": fallback_reason,
+            "求解统计": opt_result.get("stats", ""),
             "ga_population_size": cfg.ga_population_size,
             "ga_generations": cfg.ga_generations,
             "lns_destroy_ratio": cfg.lns_destroy_ratio,
@@ -498,12 +519,6 @@ def _run_model(
         "齐套感知优化": opt_metrics,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    # 保存缓存时序数据供历史回看
-    if buf_ts:
-        (out_dir / "buffer_timeseries.json").write_text(
-            json.dumps(_sanitize_json(buf_ts), ensure_ascii=False), encoding="utf-8"
-        )
 
     # ── 构建前端图表数据 ──
     # 甘特图/利用率统一使用“全流程生产总时长”，避免下游工序超出横轴或被截断
@@ -595,9 +610,9 @@ def _run_model(
         "kitSpanData": kit_data,
         "utilizationData": util_data,
         "stagesData": stages_data,
-        "bufferTimeseries": buf_ts,
-        "bufferConfig": buffer_config,
         "algorithmName": _optimizer_display_name(cfg),
+        "optimizerFallbackReason": fallback_reason,
+        "optimizerStats": opt_result.get("stats", ""),
         "checks": {**checks, "工艺参数来源": param_source},
     }
 
@@ -704,7 +719,7 @@ async def upload_excel(file: UploadFile = File(...), speed_file: UploadFile = Fi
             # 不阻断上传——附件3校验失败仅仅跳过
 
     try:
-        plates, parts, checks = load_and_validate(save_path)
+        plates, parts, checks = load_and_validate_fast(save_path)
     except Exception as e:
         save_path.unlink(missing_ok=True)
         if speed_table_uploaded:
@@ -726,12 +741,18 @@ async def upload_excel(file: UploadFile = File(...), speed_file: UploadFile = Fi
         "分段数": int(parts["分段号"].nunique()),
         "套料图数": int(plates["套料图名"].nunique()),
     }
+    sa_ga_hours, nsga_hours = compute_safety_time_caps(int(len(plates)))
 
     return {
         "file_id": file_id,
         "filename": safe_name,
         "validation": clean_checks,
         "summary": summary,
+        "safety_caps": {
+            "plate_count": int(len(plates)),
+            "sa_ga_hours": sa_ga_hours,
+            "nsga_hours": nsga_hours,
+        },
         "speed_table_uploaded": speed_table_uploaded,
         "speed_sheet_count": speed_sheet_count,
     }
@@ -740,6 +761,10 @@ async def upload_excel(file: UploadFile = File(...), speed_file: UploadFile = Fi
 @app.post("/api/run")
 async def run_model(payload: dict):
     """运行排产模型。payload = {file_id, params}"""
+    if not payload.get("_in_thread"):
+        return await run_in_threadpool(
+            lambda: asyncio.run(run_model({**payload, "_in_thread": True}))
+        )
     file_id = payload.get("file_id")
     if not file_id:
         raise HTTPException(400, "缺少 file_id")
@@ -774,7 +799,9 @@ async def run_model(payload: dict):
         "small_truss_direct_palletize_minutes", "small_truss_palletize_minutes",
         "small_grind_scan_minutes", "auto_bevel_overhead_minutes", "kit_dwell_minutes",
         "n2_bevel_truss_minutes",
+        "max_compute_time_s",
     }
+    _BOOL_KEYS = {"time_priority_mode"}
     _INT_KEYS = {
         "small_sorters", "small_grinders", "large_grinders", "auto_bevel_machines",
         "manual_bevel_stations", "agvs", "cutting_machines", "finish_buffer_capacity",
@@ -791,6 +818,11 @@ async def run_model(payload: dict):
                     value = float(value)
                 elif key in _INT_KEYS:
                     value = int(value)
+                elif key in _BOOL_KEYS:
+                    if isinstance(value, str):
+                        value = value.strip().lower() in {"1", "true", "yes", "on"}
+                    else:
+                        value = bool(value)
             except (TypeError, ValueError):
                 raise HTTPException(400, f"参数 {key} 类型错误，期望数值")
             setattr(cfg, key, value)
@@ -800,54 +832,68 @@ async def run_model(payload: dict):
 
     # 创建结果目录
     run_id = uuid.uuid4().hex[:12]
-    out_dir = RESULT_DIR / run_id
-    is_dq_nsga2 = getattr(cfg, "optimizer_method", "sa_tabu") == "dq_nsga2"
+    result_store = ResultStore(RESULT_DIR, run_id)
+    result_store.ensure_layout()
+    static_job_id = f"static_{run_id}"
+    out_dir = result_store.staging_dir(static_job_id)
+    is_dq_nsga2 = resolve_optimizer_method(cfg) == "dq_nsga2"
+    client_token = payload.get("client_token")
 
     try:
-        plates, parts, checks = load_and_validate(input_path)
+        plates, parts, checks = load_and_validate_fast(input_path)
         # P4-3：普通算法双轨并行；DQN+NSGA-II 只跑一次 Pareto 前沿，
         # 再分别按 capacity/balanced 规则从同一前沿选两个交付解。
-        _prev_env = os.environ.get("OPTIMIZER_PARALLEL")
-        os.environ["OPTIMIZER_PARALLEL"] = str(max(2, (os.cpu_count() or 4) // 2))
+        cpu_total = max(1, int(os.cpu_count() or 4))
+        # 双轨各分一半 CPU，两轨合计用满全部核心；
+        # DQN+NSGA-II 只跑一次 Pareto 前沿，直接使用全部核心。
+        track_workers = cpu_total if is_dq_nsga2 else max(1, cpu_total // 2)
 
         def _run_one(track: str, sub: str | None):
             target = out_dir if sub is None else out_dir / sub
             return _run_model(
                 plates, parts, cfg, target, checks, speed_table_path,
-                eval_track=track, progress_tag=run_id, manage_progress=False,
+                eval_track=track, cancel_token=client_token,
+                parallel_workers=track_workers,
             )
 
-        try:
-            if is_dq_nsga2:
-                front_store: dict = {}
-                result = _run_model(
-                    plates, parts, cfg, out_dir, checks, speed_table_path,
-                    eval_track="capacity", progress_tag=run_id,
-                    manage_progress=False, pareto_front_store=front_store,
-                )
-                balanced_result = _run_model(
-                    plates, parts, cfg, out_dir / "balanced", checks, speed_table_path,
-                    eval_track="balanced", progress_tag=run_id,
-                    manage_progress=False, pareto_front_store=front_store,
-                )
-            else:
-                from concurrent.futures import ThreadPoolExecutor
+        if is_dq_nsga2:
+            front_store: dict = {}
+            result = _run_model(
+                plates, parts, cfg, out_dir, checks, speed_table_path,
+                eval_track="capacity", pareto_front_store=front_store,
+                cancel_token=client_token,
+                parallel_workers=track_workers,
+            )
+            balanced_result = _run_model(
+                plates, parts, cfg, out_dir / "balanced", checks, speed_table_path,
+                eval_track="balanced", pareto_front_store=front_store,
+                cancel_token=client_token,
+                parallel_workers=track_workers,
+            )
+        else:
+            from concurrent.futures import ThreadPoolExecutor
 
-                with ThreadPoolExecutor(max_workers=2) as _dual_exec:
-                    _fut_cap = _dual_exec.submit(_run_one, "capacity", None)
-                    _fut_bal = _dual_exec.submit(_run_one, "balanced", "balanced")
-                    result = _fut_cap.result()
-                    balanced_result = _fut_bal.result()
-        finally:
-            with _progress_lock:
-                _optimization_progress.pop(run_id, None)
-            if _prev_env is None:
-                os.environ.pop("OPTIMIZER_PARALLEL", None)
-            else:
-                os.environ["OPTIMIZER_PARALLEL"] = _prev_env
+            with ThreadPoolExecutor(max_workers=2) as _dual_exec:
+                _fut_cap = _dual_exec.submit(_run_one, "capacity", None)
+                _fut_bal = _dual_exec.submit(_run_one, "balanced", "balanced")
+                result = _fut_cap.result()
+                balanced_result = _fut_bal.result()
+    except CalculationCancelled as e:
+        result_store.discard_staging(static_job_id)
+        with _run_cancel_lock:
+            _run_cancel_flags.discard(client_token)
+        raise HTTPException(409, str(e))
     except Exception as e:
+        result_store.discard_staging(static_job_id)
+        with _run_cancel_lock:
+            _run_cancel_flags.discard(client_token)
         traceback.print_exc()
         raise HTTPException(500, f"模型运行失败: {e}")
+
+    with _run_cancel_lock:
+        _run_cancel_flags.discard(client_token)
+
+    result_store.commit(out_dir, static_job_id)
 
     # 记录历史（P1-1 修复：原子化读-改-写）
     _atomic_history_update(lambda h: h["runs"].insert(0, {
@@ -890,17 +936,14 @@ async def run_model(payload: dict):
     return result
 
 
-@app.get("/api/run/progress/{run_id}")
-async def get_run_progress(run_id: str):
-    """查询优化进度（供前端轮询）。"""
-    with _progress_lock:
-        prog = _optimization_progress.get(run_id)
-    if prog is None:
-        # 检查是否已完成（结果目录存在）
-        if (RESULT_DIR / run_id).exists():
-            return {"status": "completed", "progress_pct": 100.0}
-        return {"status": "not_found", "progress_pct": 0.0}
-    return {"status": "running", **prog}
+@app.post("/api/run/cancel")
+async def cancel_model_run(payload: dict):
+    token = payload.get("client_token")
+    if not token:
+        raise HTTPException(400, "缺少 client_token")
+    with _run_cancel_lock:
+        _run_cancel_flags.add(str(token))
+    return {"status": "cancelled", "client_token": str(token)}
 
 
 @app.get("/api/report/{run_id}")
@@ -1104,14 +1147,6 @@ def _history_report_payload(
             "plate": _resolve_stage_plate(str(r.iloc[0]), part_plate_map),
         })
 
-    buf_ts = None
-    buf_ts_path = run_dir / "buffer_timeseries.json"
-    if buf_ts_path.exists():
-        try:
-            buf_ts = json.loads(buf_ts_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            buf_ts = None
-
     _file_names = {
         "schedule_csv": "optimized_plate_schedule.csv",
         "completion_csv": "part_completion.csv",
@@ -1122,10 +1157,10 @@ def _history_report_payload(
         "kit_png": "kit_span.png",
         "util_png": "resource_utilisation.png",
     }
-    if run_dir.parent.name == "results":
-        files = {k: f"{run_id}/{v}" for k, v in _file_names.items()}
+    if run_dir.name == "balanced":
+        files = {k: f"{run_id}/balanced/{v}" for k, v in _file_names.items()}
     else:
-        files = {k: f"{run_id}/{run_dir.name}/{v}" for k, v in _file_names.items()}
+        files = {k: f"{run_id}/{v}" for k, v in _file_names.items()}
 
     return {
         "run_id": run_id,
@@ -1141,7 +1176,6 @@ def _history_report_payload(
         "kitSpanData": kit_data,
         "utilizationData": util_data,
         "stagesData": stages_data,
-        "bufferTimeseries": buf_ts,
         "files": files,
     }
 
@@ -1149,9 +1183,11 @@ def _history_report_payload(
 @app.get("/api/run/{run_id}")
 async def get_run_detail(run_id: str):
     """获取某次历史运行的完整结果（用于切换查看）。"""
-    run_dir = RESULT_DIR / run_id
-    if not run_dir.exists():
+    run_root = RESULT_DIR / run_id
+    if not run_root.exists():
         raise HTTPException(404, "运行记录不存在")
+    store = ResultStore(RESULT_DIR, run_id)
+    run_dir = store.active_dir()
     summary_path = run_dir / "summary.json"
     if not summary_path.exists():
         raise HTTPException(404, "结果数据已丢失")
@@ -1286,14 +1322,6 @@ async def get_run_detail(run_id: str):
         })
 
     # 读取缓存时序数据（新运行有，旧历史记录可能缺失）
-    buf_ts = None
-    buf_ts_path = run_dir / "buffer_timeseries.json"
-    if buf_ts_path.exists():
-        try:
-            buf_ts = json.loads(buf_ts_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            buf_ts = None
-
     return {
         "run_id": run_id,
         "algorithmName": stored_name,
@@ -1308,7 +1336,6 @@ async def get_run_detail(run_id: str):
         "kitSpanData": kit_data,
         "utilizationData": util_data,
         "stagesData": stages_data,
-        "bufferTimeseries": buf_ts,
         "files": {
             "schedule_csv": f"{run_id}/optimized_plate_schedule.csv",
             "completion_csv": f"{run_id}/part_completion.csv",
@@ -1322,20 +1349,369 @@ async def get_run_detail(run_id: str):
     }
 
 
+def _resolve_dynamic_context(
+    run_id: str,
+    plate_file_id: str | None = None,
+    speed_file_id: str | None = None,
+):
+    """解析动态重排所需的原始输入、速度表和运行参数。"""
+    if not run_id:
+        raise HTTPException(400, "缺少 run_id")
+    run_dir = _safe_result_path(run_id)
+    if not run_dir.exists():
+        raise HTTPException(404, "运行记录不存在")
+
+    history = _load_history()
+    history_item = next((item for item in history.get("runs", []) if item.get("id") == run_id), None)
+    file_id = (history_item or {}).get("file_id", (history_item or {}).get("id", run_id))
+    candidates = [p for p in UPLOAD_DIR.glob(f"{file_id}_*") if "_speed_" not in p.name]
+    if not candidates:
+        raise HTTPException(500, "原始上传文件已丢失，请重新上传数据后运行")
+    input_path = candidates[0]
+    speed_candidates = list(UPLOAD_DIR.glob(f"{file_id}_speed_*"))
+    speed_table_path = str(speed_candidates[0]) if speed_candidates else None
+    override_input_path = None
+    override_speed_path = None
+    if plate_file_id:
+        matches = [p for p in UPLOAD_DIR.glob(f"{plate_file_id}_*") if "_speed_" not in p.name]
+        if not matches:
+            raise HTTPException(404, "变更后的附件2不存在，请重新上传")
+        override_input_path = matches[0]
+    if speed_file_id:
+        matches = list(UPLOAD_DIR.glob(f"{speed_file_id}_speed_*"))
+        if not matches:
+            raise HTTPException(404, "变更后的附件3不存在，请重新上传")
+        override_speed_path = matches[0]
+    return (
+        run_dir,
+        input_path,
+        speed_table_path,
+        dict((history_item or {}).get("params", {}) or {}),
+        override_input_path,
+        override_speed_path,
+    )
+
+
+def _dynamic_service(
+    run_id: str,
+    plate_file_id: str | None = None,
+    speed_file_id: str | None = None,
+) -> DynamicRescheduleService:
+    (
+        run_dir,
+        input_path,
+        speed_table_path,
+        params,
+        override_input_path,
+        override_speed_path,
+    ) = _resolve_dynamic_context(run_id, plate_file_id, speed_file_id)
+    return DynamicRescheduleService(
+        run_dir=run_dir,
+        input_path=input_path,
+        speed_table_path=speed_table_path,
+        params=params,
+        override_input_path=override_input_path,
+        override_speed_table_path=override_speed_path,
+        input_file_id=plate_file_id,
+        speed_file_id=speed_file_id,
+    )
+
+
+@app.get("/api/dynamic/state/{run_id}")
+async def dynamic_state(run_id: str):
+    """返回动态重排版本、当前故障清单、资源目录和最新 KPI。"""
+    try:
+        return _sanitize_json(_dynamic_service(run_id).get_state())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(500, f"读取动态状态失败: {exc}")
+
+
+@app.post("/api/dynamic/clear-upload/{run_id}")
+async def clear_dynamic_upload(run_id: str):
+    try:
+        return _sanitize_json(_dynamic_service(run_id).clear_uploaded_file())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(500, f"删除附件2失败: {exc}")
+
+
+@app.post("/api/dynamic/upload/{run_id}")
+async def upload_dynamic_data(
+    run_id: str,
+    plate_file: UploadFile = File(...),
+    speed_file: UploadFile | None = File(None),
+):
+    """上传订单变更后的全新附件2，并按基础排产相同规则校验。"""
+    import time as _time
+
+    _resolve_dynamic_context(run_id)
+    upload_start = _time.perf_counter()
+    file_id = uuid.uuid4().hex[:12]
+    plate_filename = Path(plate_file.filename or "附件2.xlsx").name
+    plate_suffix = Path(plate_filename).suffix.lower()
+    if plate_suffix not in {".xlsx", ".xls"}:
+        plate_suffix = ".xlsx"
+    plate_path = UPLOAD_DIR / f"{file_id}_attachment2{plate_suffix}"
+    plate_bytes = await plate_file.read()
+    if len(plate_bytes) > 30 * 1024 * 1024:
+        raise HTTPException(400, "附件2超过 30MB 限制")
+    plate_path.write_bytes(plate_bytes)
+    try:
+        plates, parts, checks = load_and_validate_fast(plate_path)
+    except Exception as exc:
+        try:
+            plate_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(400, f"附件2读取失败: {exc}")
+
+    speed_payload = {
+        "uploaded": False,
+        "file_id": None,
+        "filename": None,
+        "sheet_count": 0,
+    }
+    if speed_file is not None and speed_file.filename:
+        speed_name = Path(speed_file.filename).name
+        speed_suffix = Path(speed_name).suffix.lower()
+        if speed_suffix not in {".xlsx", ".xls"}:
+            speed_suffix = ".xlsx"
+        speed_path = UPLOAD_DIR / f"{file_id}_speed_attachment3{speed_suffix}"
+        speed_bytes = await speed_file.read()
+        if len(speed_bytes) > 30 * 1024 * 1024:
+            raise HTTPException(400, "附件3超过 30MB 限制")
+        speed_path.write_bytes(speed_bytes)
+        try:
+            pp = load_process_params(speed_path)
+        except Exception as exc:
+            try:
+                speed_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise HTTPException(400, f"附件3读取失败: {exc}")
+        speed_payload = {
+            "uploaded": True,
+            "file_id": file_id,
+            "filename": speed_name,
+            "sheet_count": len(pp.speed_table),
+        }
+
+    priority_map = {}
+    part_count_map = {}
+    name_col = "套料图名"
+    section_col = "分段号"
+    if name_col in parts.columns:
+        for plate_name, group in parts.groupby(name_col, sort=False):
+            priority_map[str(plate_name)] = int(group["齐套优先级"].min()) if "齐套优先级" in group.columns else 0
+            part_count_map[str(plate_name)] = int(len(group))
+    plate_options = []
+    for _, row in plates.iterrows():
+        plate_name = str(row.get(name_col, ""))
+        plate_options.append({
+            "name": plate_name,
+            "section": str(row.get(section_col, "")),
+            "priority": priority_map.get(plate_name, 0),
+            "part_count": part_count_map.get(plate_name, 0),
+        })
+
+    return _sanitize_json({
+        "file_id": file_id,
+        "filename": plate_filename,
+        "plate_count": int(len(plates)),
+        "plate_options": plate_options,
+        "validation": checks,
+        "speed_file": speed_payload,
+        "parse_time_s": round(_time.perf_counter() - upload_start, 3),
+    })
+
+
+def _update_history_for_dynamic(run_id: str, result: dict) -> None:
+    optimized = result.get("metrics", {}).get("optimized", {})
+    baseline = result.get("baselineMetrics", {})
+
+    def updater(history: dict) -> dict:
+        for item in history.get("runs", []):
+            if item.get("id") != run_id:
+                continue
+            item["optimized_metrics"] = optimized
+            item["base_metrics"] = baseline
+            item["algorithm_name"] = f"动态响应 - {result.get('remainingModel', 'stable')}"
+            item["score"] = _history_score(optimized, baseline)
+            item["dynamic_updated_at"] = datetime.now().isoformat(timespec="seconds")
+            break
+        return history
+
+    _atomic_history_update(updater)
+
+
+def _run_dynamic_job(job_id: str, run_id: str, payload: dict, cancel_event) -> None:
+    with _dynamic_job_lock:
+        _dynamic_jobs[job_id] = {"status": "running", "run_id": run_id}
+    try:
+        service = _dynamic_service(
+            run_id,
+            payload.get("plate_file_id"),
+            payload.get("speed_file_id"),
+        )
+        result = _sanitize_json(service.reschedule(payload, cancel_check=cancel_event.is_set))
+        _update_history_for_dynamic(run_id, result)
+        with _dynamic_job_lock:
+            _dynamic_jobs[job_id] = {
+                "status": "completed",
+                "run_id": run_id,
+                "result": result,
+            }
+    except Exception as exc:
+        traceback.print_exc()
+        is_cancelled = exc.__class__.__name__ == "DynamicRescheduleCancelled"
+        ResultStore(RESULT_DIR, run_id).discard_staging(job_id)
+        with _dynamic_job_lock:
+            _dynamic_jobs[job_id] = {
+                "status": "cancelled" if is_cancelled else "failed",
+                "run_id": run_id,
+                "error": str(exc),
+            }
+
+
+@app.post("/api/dynamic/start")
+async def start_dynamic_reschedule(payload: dict):
+    """先返回首板快速方案，再用首板加工时长在后台优化剩余钢板。"""
+    run_id = payload.get("run_id")
+    if not run_id:
+        raise HTTPException(400, "缺少 run_id")
+    try:
+        import time as _time
+        preview_started = _time.perf_counter()
+        job_id = uuid.uuid4().hex[:12]
+        service = _dynamic_service(
+            str(run_id),
+            payload.get("plate_file_id"),
+            payload.get("speed_file_id"),
+        )
+        preview = _sanitize_json(service.reschedule({
+            **payload,
+            "preview_only": True,
+            "_job_id": job_id,
+        }))
+        preview_time_s = _time.perf_counter() - preview_started
+        first_plate = preview["first_plate"]
+        first_batch = preview.get("first_batch", {})
+        cancel_event = threading.Event()
+        background_payload = {
+            **payload,
+            "_job_id": job_id,
+            "preview_only": False,
+            "first_plate_name": first_plate["name"],
+            "first_batch_names": first_batch.get("names", [first_plate["name"]]),
+            "first_plate_duration_s": first_batch.get("duration_s", first_plate["duration_s"]),
+        }
+        with _dynamic_job_lock:
+            _dynamic_jobs[job_id] = {
+                "status": "running",
+                "run_id": str(run_id),
+                "cancel_event": cancel_event,
+            }
+        _dynamic_executor.submit(_run_dynamic_job, job_id, str(run_id), background_payload, cancel_event)
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "phase": "first_plate_ready",
+            "first_plate": first_plate,
+            "first_batch": first_batch,
+            "partialResult": preview.get("partialResult"),
+            "partialFiles": {
+                "schedule_csv": f"staging/{job_id}/optimized_plate_schedule.csv",
+                "completion_csv": f"staging/{job_id}/part_completion.csv",
+                "kit_csv": f"staging/{job_id}/kit_groups.csv",
+                "stages_csv": f"staging/{job_id}/process_stages.csv",
+            },
+            "quickMakespanHours": preview.get("quickMakespanHours", 0.0),
+            "decision_time": preview.get("decision_time", ""),
+            "preview_time_s": round(preview_time_s, 3),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(500, f"首板方案生成失败: {exc}")
+
+
+@app.get("/api/dynamic/job/{job_id}")
+async def get_dynamic_job(job_id: str):
+    with _dynamic_job_lock:
+        stored = _dynamic_jobs.get(job_id)
+        job = dict(stored) if stored is not None else None
+    if job is None:
+        raise HTTPException(404, "动态优化任务不存在")
+    job.pop("cancel_event", None)
+    return _sanitize_json(job)
+
+
+@app.post("/api/dynamic/cancel/{job_id}")
+async def cancel_dynamic_job(job_id: str):
+    with _dynamic_job_lock:
+        job = _dynamic_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(404, "动态优化任务不存在")
+        cancel_event = job.get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+        job["status"] = "cancelling"
+    return {"status": "cancelling", "job_id": job_id}
+
+
+@app.post("/api/dynamic/reschedule")
+async def dynamic_reschedule(payload: dict):
+    """执行状态化动态重排。
+
+    `faults` 是当前完整故障清单，支持多资源、重叠故障和修复时间更新；
+    `order_changes` 支持取消钢板与未投料钢板改优先级；
+    `decision_time` 决定哪些任务已经完成、在制或尚未开始。
+    """
+    run_id = payload.get("run_id")
+    if not run_id:
+        raise HTTPException(400, "缺少 run_id")
+    try:
+        service = _dynamic_service(
+            str(run_id),
+            payload.get("plate_file_id"),
+            payload.get("speed_file_id"),
+        )
+        return _sanitize_json(service.reschedule(payload))
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(500, f"动态重排失败: {exc}")
+
+
 @app.post("/api/reschedule")
 async def reschedule(payload: dict):
-    """动态重调度：处理机器故障/插单/紧急插单等场景。
+    """兼容旧前端入口，转发到新的动态响应引擎。
 
     payload = {
         run_id: str,           # 原运行ID
-        scenario: str,         # "machine_failure" | "rush_order" | "reoptimize"
-        fault_time_h: float,   # 故障发生时间（小时，从0开始）
-        fault_machine: str,    # 故障机器名（如"N5"）
-        fault_duration_h: float, # 故障持续时长（小时）
-        rush_plates: list,     # 插单钢板列表（可选）
-        time_limit_s: float,   # 重调度时间限制（默认5s）
+        faults: list,
+        order_changes: list,
+        decision_time: str,
+        in_process_policy: str,
     }
     """
+    return await dynamic_reschedule(payload)
+
+
+@app.post("/api/reschedule_legacy")
+async def reschedule_legacy(payload: dict):
+    """旧版单故障重排实现，仅保留用于回溯历史运行，不再由界面调用。"""
     import time
 
     run_id = payload.get("run_id")
@@ -1390,7 +1766,7 @@ async def reschedule(payload: dict):
     t_start = time.time()
 
     try:
-        plates, parts, checks = load_and_validate(input_path)
+        plates, parts, checks = load_and_validate_fast(input_path)
         pp = None
         speed_table = None
         if speed_table_path and Path(speed_table_path).exists():
@@ -1557,7 +1933,7 @@ async def reschedule(payload: dict):
             })
 
         new_schedule = pd.DataFrame(final_rows)
-        new_schedule, _, new_groups, new_metrics, new_stages, new_buf_ts = build_joint_schedule(
+        new_schedule, _, new_groups, new_metrics, new_stages, _ = build_joint_schedule(
             new_schedule, parts, cfg, pp,
         )
 
@@ -1642,7 +2018,6 @@ async def reschedule(payload: dict):
             "ganttData": gantt_data,
             "stagesData": stages_data,
             "utilizationData": util_data,
-            "bufferTimeseries": new_buf_ts,
             "stats": stats,
         }
 
@@ -1678,7 +2053,7 @@ async def run_monte_carlo(run_id: str, payload: dict):
     speed_table_path = str(speed_candidates[0]) if speed_candidates else None
 
     try:
-        plates, parts, checks = load_and_validate(input_path)
+        plates, parts, checks = load_and_validate_fast(input_path)
         pp = None
         if speed_table_path and Path(speed_table_path).exists():
             pp = load_process_params(Path(speed_table_path))

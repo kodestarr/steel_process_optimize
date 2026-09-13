@@ -5,16 +5,96 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
+
+
+class AvailabilityCalendar:
+    """资源不可用时间轴，时间单位为分钟。
+
+    动态重调度把每个资源单元（切割头、胎架、打磨机、AGV 等）
+    表达为独立资源键。资源键可以拥有多个停用区间，区间重叠时取并集。
+    """
+
+    def __init__(self, outages: dict[str, list[tuple[float, float]] | list[list[float]]] | None = None):
+        self._outages: dict[str, list[tuple[float, float]]] = {}
+        if outages:
+            for resource_id, windows in outages.items():
+                for window in windows or []:
+                    if len(window) >= 2:
+                        self.add(resource_id, float(window[0]), float(window[1]))
+
+    def add(self, resource_id: str, start: float, end: float) -> None:
+        if not resource_id or end <= start:
+            return
+        self._outages.setdefault(str(resource_id), []).append((float(start), float(end)))
+        self._outages[str(resource_id)].sort(key=lambda item: (item[0], item[1]))
+
+    @property
+    def is_empty(self) -> bool:
+        return not any(windows for windows in self._outages.values())
+
+    def merged(self, resource_id: str) -> list[tuple[float, float]]:
+        windows = sorted(self._outages.get(str(resource_id), []), key=lambda item: (item[0], item[1]))
+        if not windows:
+            return []
+        merged: list[tuple[float, float]] = [windows[0]]
+        for start, end in windows[1:]:
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end + 1e-9:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def is_available(self, resource_id: str, start: float, duration: float = 0.0) -> bool:
+        end = float(start) + max(0.0, float(duration))
+        for off_start, off_end in self.merged(resource_id):
+            if end <= off_start + 1e-9:
+                continue
+            if float(start) >= off_end - 1e-9:
+                continue
+            return False
+        return True
+
+    def next_available(self, resource_id: str, start: float, duration: float = 0.0) -> float:
+        """返回不早于 start、且持续 duration 不与停用区间相交的最早时刻。"""
+        cursor = max(0.0, float(start))
+        duration = max(0.0, float(duration))
+        for _ in range(1000):
+            changed = False
+            for off_start, off_end in self.merged(resource_id):
+                if cursor + duration <= off_start + 1e-9:
+                    break
+                if cursor >= off_end - 1e-9:
+                    continue
+                cursor = off_end
+                changed = True
+            if not changed:
+                return cursor
+        return cursor
+
+    def to_dict(self) -> dict[str, list[list[float]]]:
+        return {key: [[s, e] for s, e in self.merged(key)] for key in sorted(self._outages)}
+
+
+def _coerce_availability_calendar(
+    outages: AvailabilityCalendar | dict | None,
+) -> AvailabilityCalendar:
+    if isinstance(outages, AvailabilityCalendar):
+        return outages
+    return AvailabilityCalendar(outages or {})
 
 
 @dataclass
@@ -63,6 +143,10 @@ class ModelConfig:
     optimizer_method: str = "sa_tabu"  # sa_tabu | ga_lns | dq_nsga2
     objective_type: str = "linear"     # linear | quadratic | auto
     eval_track: str = "capacity"       # capacity=产能优先(当前), balanced=兼顾三指标(原评价)
+    max_compute_time_s: float = 300.0  # 用户可接受的最大计算时间（秒），实际预算按 0.95 使用
+    time_priority_mode: bool = True    # True=时间优先，自动匹配迭代/代数尽量用满预算
+    plate_count: int = 0               # 当前附件2的钢板数，用于动态计算安全上限
+    safety_time_cap_s: float = 0.0     # 当前算法对应的内部安全时间上限（秒）
     ga_population_size: int = 16
     ga_generations: int = 10
     ga_crossover_rate: float = 0.85
@@ -160,6 +244,97 @@ class ModelConfig:
         return cfg
 
 
+def compute_time_budget_seconds(cfg) -> float:
+    """返回优化器可用的实际计算预算：最大时间 × 0.95。
+
+    关闭时间优先模式时返回 inf，表示完全按用户模型参数运行，不受时间限制。
+    """
+    if not bool(getattr(cfg, "time_priority_mode", True)):
+        return float("inf")
+    try:
+        max_compute_time_s = float(getattr(cfg, "max_compute_time_s", 300.0) or 300.0)
+    except (TypeError, ValueError):
+        max_compute_time_s = 300.0
+    user_budget = max(0.1, max_compute_time_s * 0.95)
+    safety_cap_s = float(getattr(cfg, "safety_time_cap_s", 0.0) or 0.0)
+    if safety_cap_s <= 0.0:
+        safety_cap_s = applicable_safety_time_cap_seconds(cfg)
+    if safety_cap_s > 0.0:
+        user_budget = min(user_budget, safety_cap_s)
+    return max(0.1, user_budget)
+
+
+# 安全上限基准：109 张钢板时，SA/GA 最长 6h，DQN+NSGA-II 最长 8h。
+# 评估成本近似随钢板数线性增长，因此上限按板数线性缩放，并设全局封顶。
+SAFETY_TIME_BASE_PLATES = 109.0
+SAFETY_TIME_BASE_SA_GA_HOURS = 6.0
+SAFETY_TIME_BASE_NSGA_HOURS = 8.0
+SAFETY_TIME_MAX_SA_GA_HOURS = 24.0
+SAFETY_TIME_MAX_NSGA_HOURS = 36.0
+
+
+def compute_safety_time_caps(n_plates: int) -> tuple[float, float]:
+    """按钢板数返回 (SA/GA安全上限小时, DQN+NSGA-II安全上限小时)。"""
+    n = int(n_plates or 0)
+    if n <= 0:
+        n = int(SAFETY_TIME_BASE_PLATES)
+    scale = n / SAFETY_TIME_BASE_PLATES
+    sa_ga_hours = min(
+        SAFETY_TIME_MAX_SA_GA_HOURS,
+        max(2.0, SAFETY_TIME_BASE_SA_GA_HOURS * scale),
+    )
+    nsga_hours = min(
+        SAFETY_TIME_MAX_NSGA_HOURS,
+        max(3.0, SAFETY_TIME_BASE_NSGA_HOURS * scale),
+    )
+    return round(sa_ga_hours, 2), round(nsga_hours, 2)
+
+
+def applicable_safety_time_cap_seconds(cfg) -> float:
+    """返回当前算法对应的内部安全时间上限（秒）。"""
+    sa_ga_hours, nsga_hours = compute_safety_time_caps(int(getattr(cfg, "plate_count", 0) or 0))
+    method = getattr(cfg, "optimizer_method", "sa_tabu") or "sa_tabu"
+    cap_hours = nsga_hours if method == "dq_nsga2" else sa_ga_hours
+    return float(cap_hours) * 3600.0
+
+
+def resolve_optimizer_method(cfg) -> str:
+    """解析实际使用的优化器；计算时间低于 10s 时 DQN+NSGA-II 自动降级为 SA+Tabu。"""
+    method = getattr(cfg, "optimizer_method", "sa_tabu") or "sa_tabu"
+    if method == "quadratic":  # 旧版兼容：quadratic 表示 SA+Tabu + 二次评价
+        return "sa_tabu"
+    if method == "dq_nsga2" and bool(getattr(cfg, "time_priority_mode", True)):
+        try:
+            max_compute_time_s = float(getattr(cfg, "max_compute_time_s", 300.0) or 300.0)
+        except (TypeError, ValueError):
+            max_compute_time_s = 300.0
+        if max_compute_time_s < 10.0:
+            return "sa_tabu"
+    return method
+
+
+def auto_iteration_cap(cfg, user_iterations: int, time_budget_seconds: float) -> int:
+    """时间优先模式下放大迭代上限，避免迭代次数先于时间预算耗尽。"""
+    if not bool(getattr(cfg, "time_priority_mode", True)) or not math.isfinite(time_budget_seconds):
+        return int(user_iterations)
+    auto_cap = int(max(1.0, float(time_budget_seconds)) * 50)
+    return max(int(user_iterations), min(2_000_000, auto_cap))
+
+
+def auto_generation_cap(
+    cfg,
+    user_generations: int,
+    time_budget_seconds: float,
+    seconds_per_generation: float = 2.0,
+) -> int:
+    """时间优先模式下放大代数上限，避免代数先于时间预算耗尽。"""
+    if not bool(getattr(cfg, "time_priority_mode", True)) or not math.isfinite(time_budget_seconds):
+        return int(user_generations)
+    per_gen = max(0.1, float(seconds_per_generation))
+    auto_cap = int(max(1.0, float(time_budget_seconds)) / per_gen) + int(user_generations)
+    return max(int(user_generations), min(5000, auto_cap))
+
+
 @dataclass
 class ProcessParams:
     """附件3 工艺用时计算表提取的参数，替代 ModelConfig 中的硬编码速度。"""
@@ -254,10 +429,17 @@ class AGVPathNetwork:
       3. 引入真实的AGV避让等待时间
     """
 
-    def __init__(self, n_agvs: int = 2, zone_travel_time: float = 0.5, has_crane: bool = True):
+    def __init__(
+        self,
+        n_agvs: int = 2,
+        zone_travel_time: float = 0.5,
+        has_crane: bool = True,
+        outages: AvailabilityCalendar | dict | None = None,
+    ):
         self.n_agvs = n_agvs
         self.zone_travel_time = zone_travel_time
         self.has_crane = has_crane
+        self.calendar = _coerce_availability_calendar(outages)
         self.start_zone = "切割胎架"
 
         # 每个AGV的状态: {agv_id: (free_time, current_zone)}
@@ -329,6 +511,12 @@ class AGVPathNetwork:
             departure = max(ready - travel_penalty, free_time)
             zone_free_time = self.zone_free.get(origin_zone, 0.0)
             departure = max(departure, zone_free_time)
+            if not self.calendar.is_empty:
+                departure = self.calendar.next_available(
+                    f"AGV{agv_id + 1}",
+                    departure,
+                    travel_penalty + duration,
+                )
             candidates.append((departure, agv_id))
 
         # 按就绪时间排序
@@ -456,51 +644,95 @@ class TrussPool:
     当臂上一次服务N2、本次要服务N5（或反之）时，准备时间增加 travel_time。
     """
 
-    def __init__(self, n_arms: int = 2, travel_time: float = 0.5, name_prefix: str = "自动分拣"):
+    def __init__(
+        self,
+        n_arms: int = 2,
+        travel_time: float = 0.5,
+        name_prefix: str = "自动分拣",
+        outages: AvailabilityCalendar | dict | None = None,
+    ):
         self.n_arms = n_arms
         self.travel_time = travel_time
         self.name_prefix = name_prefix
+        self.calendar = _coerce_availability_calendar(outages)
         # (free_time, last_machine) for each arm
         self.arms: list[tuple[float, str]] = [(0.0, "") for _ in range(n_arms)]
         self.busy: dict[str, float] = {}  # arm_label → total busy time
 
     def reserve(self, ready: float, duration: float, machine: str) -> tuple[str, float, float]:
         """Reserve a truss arm, accounting for cross-machine travel time."""
+        if self.calendar.is_empty:
+            best_arm = 0
+            best_start = float("inf")
+            for i, (free_time, last_machine) in enumerate(self.arms):
+                travel_penalty = self.travel_time if (last_machine and last_machine != machine) else 0.0
+                effective_ready = max(ready - travel_penalty, free_time)
+                if effective_ready < best_start:
+                    best_start = effective_ready
+                    best_arm = i
+
+            arm_label = f"{self.name_prefix}{best_arm + 1}"
+            travel_penalty = (
+                self.travel_time
+                if self.arms[best_arm][1] and self.arms[best_arm][1] != machine
+                else 0.0
+            )
+            loaded_start = max(best_start + travel_penalty, ready)
+            end = loaded_start + max(0.0, duration)
+            self.arms[best_arm] = (end, machine)
+            self.busy[arm_label] = self.busy.get(arm_label, 0.0) + max(0.0, duration)
+            return arm_label, best_start, end
+
         best_arm = 0
-        best_start = float("inf")
+        best_loaded_start = float("inf")
 
         for i, (free_time, last_machine) in enumerate(self.arms):
+            arm_label = f"{self.name_prefix}{i + 1}"
             # Travel penalty if switching machines
             travel_penalty = self.travel_time if (last_machine and last_machine != machine) else 0.0
             effective_ready = max(ready - travel_penalty, free_time)
-            if effective_ready < best_start:
-                best_start = effective_ready
+            loaded_start = max(effective_ready + travel_penalty, ready)
+            loaded_start = self.calendar.next_available(arm_label, loaded_start, max(0.0, duration))
+            if loaded_start < best_loaded_start:
+                best_loaded_start = loaded_start
                 best_arm = i
 
         arm_label = f"{self.name_prefix}{best_arm + 1}"
-        travel_penalty = (
-            self.travel_time
-            if self.arms[best_arm][1] and self.arms[best_arm][1] != machine
-            else 0.0
-        )
-        loaded_start = max(best_start + travel_penalty, ready)
+        loaded_start = best_loaded_start
         end = loaded_start + max(0.0, duration)
         self.arms[best_arm] = (end, machine)
         self.busy[arm_label] = self.busy.get(arm_label, 0.0) + max(0.0, duration)
-        return arm_label, best_start, end
+        return arm_label, loaded_start, end
 
 
 class ResourcePool:
-    def __init__(self, names: Iterable[str]):
+    def __init__(
+        self,
+        names: Iterable[str],
+        outages: AvailabilityCalendar | dict | None = None,
+    ):
         self.free = {name: 0.0 for name in names}
         self.busy = {name: 0.0 for name in names}
+        self.calendar = _coerce_availability_calendar(outages)
 
     def reserve(self, ready: float, duration: float) -> Tuple[str, float, float]:
-        name = min(self.free, key=self.free.get)
-        start = max(ready, self.free[name])
-        end = start + max(0.0, duration)
+        if not self.free:
+            raise RuntimeError("ResourcePool 至少需要一个资源")
+        if self.calendar.is_empty:
+            name = min(self.free, key=self.free.get)
+            start = max(ready, self.free[name])
+            end = start + max(0.0, duration)
+            self.free[name] = end
+            self.busy[name] += max(0.0, duration)
+            return name, start, end
+        duration = max(0.0, duration)
+        candidates: list[tuple[float, float, str]] = []
+        for name, free_time in self.free.items():
+            start = self.calendar.next_available(name, max(ready, free_time), duration)
+            candidates.append((start, start + duration, name))
+        start, end, name = min(candidates, key=lambda item: (item[0], item[1], item[2]))
         self.free[name] = end
-        self.busy[name] += max(0.0, duration)
+        self.busy[name] += duration
         return name, start, end
 
 
@@ -511,13 +743,19 @@ class CranePool:
     reserve() 会从 ready 时刻开始找最早可插入的空档。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        outages: AvailabilityCalendar | dict | None = None,
+        resource_id: str = "天车",
+    ) -> None:
         self.intervals: list[tuple[float, float]] = []
         self.current_location: str = "胎架"
         self.last_empty_origin: str = ""
         self.last_empty_dest: str = ""
         self.last_loaded_origin: str = ""
         self.last_loaded_dest: str = ""
+        self.calendar = _coerce_availability_calendar(outages)
+        self.resource_id = resource_id
 
     @staticmethod
     def _loaded_travel_time(from_loc: str, to_loc: str) -> float:
@@ -569,8 +807,23 @@ class CranePool:
         return start, loaded_start, loaded_end
 
     def reserve(self, ready: float, duration: float) -> tuple[float, float]:
+        if self.calendar.is_empty:
+            if duration <= 0:
+                return max(0.0, ready), max(0.0, ready)
+            start = max(0.0, ready)
+            for s, e in sorted(self.intervals):
+                if start >= e:
+                    continue
+                if start + duration <= s:
+                    break
+                start = max(start, e)
+            end = start + duration
+            self.intervals.append((start, end))
+            self.intervals.sort()
+            return start, end
         if duration <= 0:
-            return max(0.0, ready), max(0.0, ready)
+            start = self.calendar.next_available(self.resource_id, max(0.0, ready), 0.0)
+            return start, start
         start = max(0.0, ready)
         for s, e in sorted(self.intervals):
             if start >= e:
@@ -578,6 +831,7 @@ class CranePool:
             if start + duration <= s:
                 break
             start = max(start, e)
+        start = self.calendar.next_available(self.resource_id, start, duration)
         end = start + duration
         self.intervals.append((start, end))
         self.intervals.sort()
@@ -787,6 +1041,23 @@ def load_and_validate(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str,
     return plates, parts, checks
 
 
+@lru_cache(maxsize=8)
+def _load_and_validate_cached(path_str: str, mtime_ns: int, size: int):
+    return load_and_validate(Path(path_str))
+
+
+def load_and_validate_fast(path: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, object]]:
+    """带文件指纹缓存的数据读取与校验，重复读取同一附件时避免再次解析 Excel。"""
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    plates, parts, checks = _load_and_validate_cached(
+        str(resolved),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+    )
+    return plates.copy(deep=True), parts.copy(deep=True), copy.deepcopy(checks)
+
+
 def cut_duration(plate: pd.Series, cfg: ModelConfig, speed_table: dict | None = None) -> float:
     """计算单张钢板切割工时。
 
@@ -856,6 +1127,12 @@ def cut_duration(plate: pd.Series, cfg: ModelConfig, speed_table: dict | None = 
 
 
 def plate_features(plates: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, speed_table: dict | None = None) -> pd.DataFrame:
+    cfg.plate_count = int(len(plates))
+    sa_ga_hours, nsga_hours = compute_safety_time_caps(cfg.plate_count)
+    method = getattr(cfg, "optimizer_method", "sa_tabu") or "sa_tabu"
+    cfg.safety_time_cap_s = float(
+        (nsga_hours if method == "dq_nsga2" else sa_ga_hours) * 3600.0
+    )
     p = plates.copy()
     p["切割工时(min)"] = p.apply(lambda r: cut_duration(r, cfg, speed_table), axis=1)
     group_totals = parts.groupby(["分段号", "齐套优先级"]).size().rename("组零件数").reset_index()
@@ -1121,6 +1398,9 @@ def build_joint_schedule(
     parts: pd.DataFrame,
     cfg: ModelConfig,
     pp: ProcessParams | None = None,
+    outage_calendar: AvailabilityCalendar | dict | None = None,
+    initial_state: dict | None = None,
+    enforce_buffer_capacity: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, float], pd.DataFrame, list]:
     """切割与下游联合排程。
 
@@ -1129,6 +1409,9 @@ def build_joint_schedule(
     实际动作的完成时间作为胎架释放时间，下一块钢板只有胎架真正释放后才能
     开始切割。返回 (排程, 零件完成表, 齐套分组, 指标, 工序表, 缓存时序)。
     """
+    calendar = _coerce_availability_calendar(outage_calendar)
+    initial_state = initial_state or {}
+
     if "切割序号" in schedule.columns and schedule["切割序号"].notna().all():
         ordered = schedule.sort_values("切割序号", kind="stable").reset_index(drop=True)
     elif "切割开始(min)" in schedule.columns:
@@ -1144,8 +1427,18 @@ def build_joint_schedule(
     # Truss pool for sorting (with cross-machine travel penalty)
     per_side_truss = max(1, math.ceil(cfg.small_sorters / 2))
     truss_pools = {
-        "N2": TrussPool(n_arms=per_side_truss, travel_time=cfg.truss_travel_minutes, name_prefix="自动分拣N2"),
-        "N5": TrussPool(n_arms=per_side_truss, travel_time=cfg.truss_travel_minutes, name_prefix="自动分拣N5"),
+        "N2": TrussPool(
+            n_arms=per_side_truss,
+            travel_time=cfg.truss_travel_minutes,
+            name_prefix="自动分拣N2",
+            outages=calendar,
+        ),
+        "N5": TrussPool(
+            n_arms=per_side_truss,
+            travel_time=cfg.truss_travel_minutes,
+            name_prefix="自动分拣N5",
+            outages=calendar,
+        ),
     }
 
     def _truss_for(cut_machine: str) -> TrussPool:
@@ -1156,8 +1449,8 @@ def build_joint_schedule(
 
     per_side_grind = max(1, math.ceil(cfg.small_grinders / 2))
     sg_pools = {
-        "N2": ResourcePool([f"自动打磨N2{i+1}" for i in range(per_side_grind)]),
-        "N5": ResourcePool([f"自动打磨N5{i+1}" for i in range(per_side_grind)]),
+        "N2": ResourcePool([f"自动打磨N2{i+1}" for i in range(per_side_grind)], outages=calendar),
+        "N5": ResourcePool([f"自动打磨N5{i+1}" for i in range(per_side_grind)], outages=calendar),
     }
 
     def _grind_for(cut_machine: str) -> ResourcePool:
@@ -1168,8 +1461,8 @@ def build_joint_schedule(
 
     per_side_lg = max(1, math.ceil(cfg.large_grinders / 2))
     lg_pools = {
-        "N2": ResourcePool([f"人工打磨N2{i+1}" for i in range(per_side_lg)]),
-        "N5": ResourcePool([f"人工打磨N5{i+1}" for i in range(per_side_lg)]),
+        "N2": ResourcePool([f"人工打磨N2{i+1}" for i in range(per_side_lg)], outages=calendar),
+        "N5": ResourcePool([f"人工打磨N5{i+1}" for i in range(per_side_lg)], outages=calendar),
     }
 
     def _large_grind_for(cut_machine: str) -> ResourcePool:
@@ -1178,8 +1471,14 @@ def build_joint_schedule(
             return lg_pools["N2"]
         return lg_pools["N5"]
 
-    ab_pool = ResourcePool([f"自动坡口{i+1}" for i in range(cfg.auto_bevel_machines)])
-    mb_pool = ResourcePool([f"人工坡口{i+1}" for i in range(cfg.manual_bevel_stations)])
+    ab_pool = ResourcePool(
+        [f"自动坡口{i+1}" for i in range(cfg.auto_bevel_machines)],
+        outages=calendar,
+    )
+    mb_pool = ResourcePool(
+        [f"人工坡口{i+1}" for i in range(cfg.manual_bevel_stations)],
+        outages=calendar,
+    )
     stages: List[Dict[str, object]] = []
     # 使用附件3工艺参数（若有），否则回退到 ModelConfig
     sg_speed = pp.small_grind_speed_mm_min if pp else cfg.small_grind_speed_mm_min
@@ -1194,8 +1493,12 @@ def build_joint_schedule(
         return end
 
     # ── 初始化AGV路径网络（Phase 1 天车运输和 Phase 2 AGV运输共用）──
-    agv_network = AGVPathNetwork(n_agvs=cfg.agvs, zone_travel_time=cfg.small_transfer_minutes)
-    crane_pool = CranePool()
+    agv_network = AGVPathNetwork(
+        n_agvs=cfg.agvs,
+        zone_travel_time=cfg.small_transfer_minutes,
+        outages=calendar,
+    )
+    crane_pool = CranePool(outages=calendar)
 
     # ── 联合排程：切割 + 下游处理按钢板顺序同步推进 ──
     part_proc_done: Dict[str, float] = {}   # 零件加工完成（可码垛）时刻
@@ -1209,9 +1512,18 @@ def build_joint_schedule(
     part_bevel_dur: Dict[str, float] = {}
 
     machines = machine_names(cfg)
-    free = {m: 0.0 for m in machines}
-    worktables = {m: [0.0, 0.0] for m in machines}
-    gun_free = {m: 0.0 for m in machines}
+    initial_free = initial_state.get("free", {})
+    initial_worktables = initial_state.get("worktables", {})
+    initial_gun_free = initial_state.get("gun_free", {})
+    free = {m: float(initial_free.get(m, 0.0)) for m in machines}
+    worktables = {
+        m: [
+            float((initial_worktables.get(m) or [0.0, 0.0])[0]),
+            float((initial_worktables.get(m) or [0.0, 0.0])[1]),
+        ]
+        for m in machines
+    }
+    gun_free = {m: float(initial_gun_free.get(m, 0.0)) for m in machines}
     last_table = {m: 1 for m in machines}
     rows: list[dict] = []
     machine_map: Dict[str, str] = {}
@@ -1526,8 +1838,13 @@ def build_joint_schedule(
         actual_table_end = max(input_table_end, en, plate_small_end, plate_large_release)
         for pname in plate_part_names:
             part_release[pname] = actual_table_end
-        worktables[machine][table_idx] = actual_table_end
-        gun_free[machine] = en
+        if initial_state:
+            # 动态重排可能给某个胎架/切割头预置清台占用，不能被子序列回写覆盖。
+            worktables[machine][table_idx] = max(worktables[machine][table_idx], actual_table_end)
+            gun_free[machine] = max(gun_free[machine], en)
+        else:
+            worktables[machine][table_idx] = actual_table_end
+            gun_free[machine] = en
         free[machine] = max(gun_free[machine], min(worktables[machine]))
 
         _pri_val = r.get("最低优先级", 0)
@@ -1603,9 +1920,6 @@ def build_joint_schedule(
     buffer_parts["坡口工作站"] = []
     buffer_parts["齐套缓存"] = []
 
-    # 缓存区占用时间序列（用于前端可视化）
-    buffer_timeseries: list[dict] = []
-
     buffer_peaks: dict[str, int] = {f"{m}码垛": 0 for m in all_machines}
     buffer_peaks["坡口缓存"] = 0
     buffer_peaks["半框缓存"] = 0
@@ -1625,6 +1939,15 @@ def build_joint_schedule(
     def _add_buffer_event(buf_name: str, entry_time: float, exit_time: float, part_label: str):
         """记录零件进入和离开缓冲区的事件。"""
         buffer_parts.setdefault(buf_name, []).append((entry_time, exit_time, part_label))
+
+    def _capacity_wait_until(buf_name: str, at_time: float, capacity: int) -> float | None:
+        """返回因容量不足需要等待到的最早时刻；容量足够时返回 None。"""
+        occupancy = _clean_and_count(buf_name, at_time)
+        buffer_peaks[buf_name] = max(buffer_peaks.get(buf_name, 0), occupancy)
+        if occupancy < max(1, capacity):
+            return None
+        active_exits = [exit_time for entry_time, exit_time, _ in buffer_parts.get(buf_name, []) if entry_time <= at_time < exit_time]
+        return (min(active_exits) + 0.1) if active_exits else (at_time + 1.0)
 
     # ── 齐套门控所需的零件/料框级时刻追踪 ──
     import heapq
@@ -1742,6 +2065,14 @@ def build_joint_schedule(
                     heapq.heappush(events, (min(active_exits) + 0.1, _seq, 0, bin_key, pnames))
                     _seq += 1
                     continue
+            if enforce_buffer_capacity:
+                target_buffer = "坡口缓存" if is_bevel_bin else "半框缓存"
+                target_capacity = bevel_buffer_cap if is_bevel_bin else half_buffer_cap
+                blocked_until = _capacity_wait_until(target_buffer, t, target_capacity)
+                if blocked_until is not None:
+                    heapq.heappush(events, (blocked_until, _seq, 0, bin_key, pnames))
+                    _seq += 1
+                    continue
             effective_ready = t
 
             agv_label, agv_start, agv_end, _ = agv_network.reserve(
@@ -1799,6 +2130,12 @@ def build_joint_schedule(
 
         elif kind == 1:
             # N5：坡口缓存区 -> 坡口工作站
+            if enforce_buffer_capacity:
+                blocked_until = _capacity_wait_until("坡口工作站", t, bevel_workstation_cap)
+                if blocked_until is not None:
+                    heapq.heappush(events, (blocked_until, _seq, 1, bin_key, pnames))
+                    _seq += 1
+                    continue
             agv_label2, agv_start2, agv_end2, _ = agv_network.reserve(
                 t, small_trans, "加工区", destination="加工区",
             )
@@ -1839,6 +2176,12 @@ def build_joint_schedule(
 
         elif kind == 2:
             # N2：打磨后桁架直接到坡口工作站
+            if enforce_buffer_capacity:
+                blocked_until = _capacity_wait_until("坡口工作站", t, bevel_workstation_cap)
+                if blocked_until is not None:
+                    heapq.heappush(events, (blocked_until, _seq, 2, bin_key, pnames))
+                    _seq += 1
+                    continue
             arrival = t
             bevel_total_dur = sum(part_bevel_dur.get(p, 0.0) for p in pnames)
             ab_name, ab_start, ab_end = ab_pool.reserve(arrival, max(bevel_total_dur, 0.1))
@@ -1967,29 +2310,6 @@ def build_joint_schedule(
         deadlock_warnings.append(
             f"[半框溢出] 半框缓存峰值={buffer_peaks['半框缓存']}/{half_buffer_cap}"
         )
-
-    # ── 生成缓存区占用时间序列（用于前端可视化）──
-    total_makespan_val = max(part_arrival.values()) if part_arrival else 0.0
-    if not (np.isfinite(total_makespan_val) and total_makespan_val > 0):
-        total_makespan_val = float(schedule["切割完成(min)"].max())
-    sample_interval = max(0.5, total_makespan_val / 200)
-    stop_val = total_makespan_val + sample_interval
-    if stop_val <= 0 or sample_interval <= 0:
-        sample_times = np.array([0.0])
-    else:
-        sample_times = np.arange(0.0, stop_val, sample_interval)
-
-    buffer_timeseries = []
-    for t in sample_times:
-        entry = {"time_h": round(float(t) / 60, 4)}
-        for m in all_machines:
-            bn = f"{m}码垛"
-            entry[f"{m}_码垛占用"] = _clean_and_count(bn, t)
-        entry["坡口缓存占用"] = _clean_and_count("坡口缓存", t)
-        entry["半框缓存占用"] = _clean_and_count("半框缓存", t)
-        entry["齐套缓存占用"] = _clean_and_count("齐套缓存", t)
-        entry["坡口工作站占用"] = _clean_and_count("坡口工作站", t)
-        buffer_timeseries.append(entry)
 
     stages_df = pd.DataFrame(stages)
     makespan = float(complete["到齐套区(min)"].max())
@@ -2164,7 +2484,7 @@ def build_joint_schedule(
         **{f"{m}码垛峰值占用率": float(min(1.0, machine_buffer_peaks.get(f"{m}码垛", 0) / max(1, buffer_cap_per_machine_map.get(m, 15)))) for m in all_machines},
         **resource_utils,
     }
-    return new_schedule, complete, group, metrics, stages_df, buffer_timeseries
+    return new_schedule, complete, group, metrics, stages_df, []
 
 
 def simulate(
@@ -2174,10 +2494,10 @@ def simulate(
     pp: ProcessParams | None = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], pd.DataFrame, list]:
     """兼容入口：返回 (零件完成表, 齐套分组, 指标, 工序表, 缓存时序)。"""
-    _, complete, groups, metrics, stages_df, buffer_timeseries = build_joint_schedule(
+    _, complete, groups, metrics, stages_df, _ = build_joint_schedule(
         schedule, parts, cfg, pp,
     )
-    return complete, groups, metrics, stages_df, buffer_timeseries
+    return complete, groups, metrics, stages_df, []
 
 
 # Competition target values for normalization (P3-3: 统一从 ModelConfig 引用)
@@ -2533,11 +2853,14 @@ def optimise(features: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, pp: 
 
     评价函数也按 cfg.objective_type 选择线性或二次非线性；DQN+NSGA-II 使用多目标自动匹配。
     """
-    method = getattr(cfg, "optimizer_method", "sa_tabu")
+    requested_method = getattr(cfg, "optimizer_method", "sa_tabu")
     objective_type = getattr(cfg, "objective_type", "linear")
-    if method == "quadratic":  # 旧版兼容
+    time_budget_s = compute_time_budget_seconds(cfg)
+    if requested_method == "quadratic":  # 旧版兼容
         method = "sa_tabu"
         objective_type = "quadratic"
+    else:
+        method = resolve_optimizer_method(cfg)
 
     if method == "dq_nsga2":
         from dqn_nsga2_optimizer import run_dq_nsga2_pareto_front
@@ -2551,6 +2874,7 @@ def optimise(features: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, pp: 
             speed_table=pp.speed_table if pp else None,
             checks={},
             iterations=cfg.local_search_iterations,
+            time_limit_seconds=time_budget_s,
         )
         track = getattr(cfg, "eval_track", "capacity")
         result = front[track]
@@ -2570,6 +2894,7 @@ def optimise(features: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, pp: 
             checks={},
             iterations=cfg.local_search_iterations,
             objective_type=objective_type,
+            time_budget_seconds=time_budget_s,
         )
     elif objective_type == "quadratic":
         from pareto_optimizer import run_quadratic_optimization
@@ -2582,6 +2907,7 @@ def optimise(features: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, pp: 
             speed_table=pp.speed_table if pp else None,
             checks={},
             iterations=cfg.local_search_iterations,
+            time_budget_seconds=time_budget_s,
         )
     else:
         from improved_optimizer import run_multi_strategy_inline
@@ -2594,6 +2920,7 @@ def optimise(features: pd.DataFrame, parts: pd.DataFrame, cfg: ModelConfig, pp: 
             speed_table=pp.speed_table if pp else None,
             checks={},
             iterations=cfg.local_search_iterations,
+            time_budget_seconds=time_budget_s,
         )
     schedule = result["schedule"]
     metrics = result["opt_metrics"]

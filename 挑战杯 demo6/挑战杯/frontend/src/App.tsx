@@ -4,6 +4,7 @@ import {
   Button,
   Space,
   Segmented,
+  Tag,
   Dropdown,
   message,
   Modal,
@@ -30,17 +31,24 @@ import KitAnalysis from './components/KitAnalysis';
 import UtilCharts from './components/UtilCharts';
 
 import ReschedulePanel from './components/ReschedulePanel';
-import BufferMonitor from './components/BufferMonitor';
-import KitDashboard from './components/KitDashboard';
 import HistorySidebar from './components/HistorySidebar';
 import LoadingPipeline from './components/LoadingPipeline';
 import ModelArchitecture from './components/ModelArchitecture';
-import { runModel, reportUrl, downloadUrl, fetchProgress } from './api';
+import { runModel, cancelRun, reportUrl, downloadUrl } from './api';
 import { COLORS, FONT } from './theme';
 
 import './App.css';
 
 const { Text } = Typography;
+
+function formatDuration(totalSeconds: number): string {
+  const s = Math.max(0, Math.round(totalSeconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return `${m}m ${rs}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m ${rs}s`;
+}
 
 const App: React.FC = () => {
   const [upload, setUpload] = useState<UploadResponse | null>(null);
@@ -49,13 +57,18 @@ const App: React.FC = () => {
   const [reportMode, setReportMode] = useState<'capacity' | 'balanced'>('capacity');
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [loadProgress, setLoadProgress] = useState<{ elapsed: number; stage: string } | null>(null);
-  const loadStartRef = useRef(0);
-  const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [lastRunSeconds, setLastRunSeconds] = useState<number | null>(null);
+  const runStartRef = useRef(0);
+  const runTokenRef = useRef<string | null>(null);
   const mountedRef = useRef(true);  // P0-5: 组件卸载标记，防止异步操作写已卸载组件
   const [activeTab, setActiveTab] = useState('import');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [prevResult, setPrevResult] = useState<RunResponse | null>(null);
+  const [dynamicRunning, setDynamicRunning] = useState(false);
+  const [dynamicGantt, setDynamicGantt] = useState<RunResponse['ganttData'] | null>(null);
+  const [dynamicStages, setDynamicStages] = useState<RunResponse['stagesData'] | null>(null);
+  const [dynamicMakespan, setDynamicMakespan] = useState<number | null>(null);
+  const [dynamicFiles, setDynamicFiles] = useState<Record<string, string> | null>(null);
   // Dark mode removed — system always uses light industrial theme
 
   const handleUploaded = useCallback((res: UploadResponse) => {
@@ -63,6 +76,11 @@ const App: React.FC = () => {
     setResult(null);
     setPrevResult(null);
     setActiveRunId(null);
+    setDynamicRunning(false);
+    setDynamicGantt(null);
+    setDynamicStages(null);
+    setDynamicMakespan(null);
+    setDynamicFiles(null);
     setActiveTab('params');
   }, []);
 
@@ -72,51 +90,25 @@ const App: React.FC = () => {
       setActiveTab('import');
       return;
     }
-    loadStartRef.current = Date.now();
-    setLoadProgress({ elapsed: 0, stage: '初始化优化...' });
     setLoading(true);
     mountedRef.current = true;  // P0-5: 每次新运行时重置标记
+    setLastRunSeconds(null);
+    runStartRef.current = Date.now();
 
-    let runId: string | null = null;
-
-    const runPromise = runModel(upload.file_id, params).then(res => {
-      runId = res.run_id;
-      return res;
-    });
-
-    // ── P2-4 修复：使用真实进度轮询替代伪时间估算 ──
-    // 后端 /api/run 是同步阻塞的，但 run_id 在优化过程中已生成。
-    // 策略：在等待 runModel 返回的同时，显示基于 elapsed 的估计阶段（诚实标注"预计"），
-    // 完成后立即用真实后端状态更新。
-    progressTimerRef.current = setInterval(() => {
-      const elapsed = (Date.now() - loadStartRef.current) / 1000;
-      // 根据已用时间粗略估计阶段（标注"预计"，非虚假精准进度）
-      let stage = '预计：数据准备中...';
-      if (elapsed > 120) stage = '预计：多目标/DRL增强搜索中...';
-      else if (elapsed > 60) stage = '预计：进化算法迭代优化中...';
-      else if (elapsed > 15) stage = '预计：离散事件仿真中...';
-      else if (elapsed > 5) stage = '预计：切割工时计算中...';
-      setLoadProgress({ elapsed, stage });
-    }, 250);  // 高频刷新预计耗时，加载层直接使用该 elapsed
+    const clientToken = crypto.randomUUID();
+    runTokenRef.current = clientToken;
+    const runPromise = runModel(upload.file_id, params, clientToken);
 
     try {
       const res = await runPromise;
       if (!mountedRef.current) return;
-      if (runId && res.run_id) {
-        try {
-          const prog = await fetchProgress(res.run_id);
-          if (prog.status === 'completed') {
-            setLoadProgress({ elapsed: (Date.now() - loadStartRef.current) / 1000, stage: '✅ 优化完成，生成结果...' });
-          }
-        } catch {
-          // 进度查询失败不影响主流程
-        }
-      }
       setPrevResult(result);
       setResult(res);
       setReportMode('capacity');
       setActiveRunId(res.run_id);
+      setDynamicRunning(false);
       setActiveTab('overview');
+      setLastRunSeconds((Date.now() - runStartRef.current) / 1000);
       message.success('计算完成！');
     } catch (e: any) {
       if (!mountedRef.current) return;
@@ -125,15 +117,27 @@ const App: React.FC = () => {
     } finally {
       if (!mountedRef.current) return;
       setLoading(false);
-      setLoadProgress(null);
-      if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
+      runTokenRef.current = null;
     }
   }, [upload, params, result]);
+
+  const handleCancelRun = useCallback(async () => {
+    const token = runTokenRef.current;
+    if (!token) return;
+    try {
+      await cancelRun(token);
+      message.info('已发出紧急中断请求');
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail ?? e?.message ?? '中断失败');
+    } finally {
+      setLoading(false);
+      runTokenRef.current = null;
+    }
+  }, []);
 
   // Cleanup progress timer and mounted flag on unmount
   useEffect(() => {
     return () => {
-      if (progressTimerRef.current) clearInterval(progressTimerRef.current);
       mountedRef.current = false;
     };
   }, []);
@@ -143,6 +147,7 @@ const App: React.FC = () => {
     setResult(data);
     setReportMode(data.reportMode === 'balanced' ? 'balanced' : 'capacity');
     setActiveRunId(runId);
+    setDynamicRunning(false);
     setActiveTab('overview');
   }, [result]);
 
@@ -179,34 +184,40 @@ const App: React.FC = () => {
     ];
   }, [result]);
 
-  const handleDownload = useCallback((key: string) => {
+    const handleDownload = useCallback((key: string) => {
     if (!result) return;
     try {
       if (key === 'report') {
         window.open(reportUrl(result.run_id, result.reportMode), '_blank');
       } else if (key.endsWith('_img')) {
+        const activeFiles = dynamicFiles ?? result.files;
         const imgMap: Record<string, string> = {
-          gantt_img: result.files.gantt_png,
-          kit_img: result.files.kit_png,
-          util_img: result.files.util_png,
+          gantt_img: activeFiles.gantt_png,
+          kit_img: activeFiles.kit_png,
+          util_img: activeFiles.util_png,
         };
         const filename = imgMap[key];
         if (filename) {
-          const rel = filename.split('/').slice(1).join('/');
+          const rel = filename.startsWith(`${result.run_id}/`)
+            ? filename.slice(result.run_id.length + 1)
+            : filename;
           window.open(downloadUrl(result.run_id, rel), '_blank');
         }
         else message.warning('找不到对应图片文件');
       } else {
+        const activeFiles = dynamicFiles ?? result.files;
         const fileMap: Record<string, string> = {
-          schedule: result.files.schedule_csv,
-          completion: result.files.completion_csv,
-          kit: result.files.kit_csv,
-          stages: result.files.stages_csv,
-          comparison: result.files.comparison_csv,
+          schedule: activeFiles.schedule_csv,
+          completion: activeFiles.completion_csv,
+          kit: activeFiles.kit_csv,
+          stages: activeFiles.stages_csv,
+          comparison: activeFiles.comparison_csv,
         };
         const filename = fileMap[key];
         if (filename) {
-          const rel = filename.split('/').slice(1).join('/');
+          const rel = filename.startsWith(`${result.run_id}/`)
+            ? filename.slice(result.run_id.length + 1)
+            : filename;
           window.open(downloadUrl(result.run_id, rel), '_blank');
         }
         else message.warning('找不到对应下载文件');
@@ -214,7 +225,7 @@ const App: React.FC = () => {
     } catch (e: any) {
       message.error(`下载失败: ${e?.message ?? '未知错误'}`);
     }
-  }, [result]);
+  }, [dynamicFiles, result]);
 
   // memo 稳定 tabItems，避免每帧销毁重建组件
   const tabItems = useMemo(() => [
@@ -222,32 +233,51 @@ const App: React.FC = () => {
     { key: 'params', label: '⚙️ 参数配置', children: <ParamConfig params={params} onChange={setParams} upload={upload} /> },
     { key: 'architecture', label: '📐 模型架构', children: <ModelArchitecture /> },
     { key: 'overview', label: '📈 结果概览', disabled: !result, children: result ? <ResultOverview data={result} prevData={prevResult} /> : <div /> },
-    { key: 'gantt', label: '🗓️ 甘特图', disabled: !result, children: result ? <GanttChart data={result.ganttData} makespanHours={result.makespanHours} stages={result.stagesData} /> : <div /> },
+    { key: 'gantt', label: '🗓️ 甘特图', disabled: !result, children: result ? <GanttChart data={dynamicGantt ?? result.ganttData} makespanHours={dynamicMakespan ?? result.makespanHours} stages={dynamicStages ?? result.stagesData} /> : <div /> },
     { key: 'kit', label: '📦 齐套分析', disabled: !result, children: result ? <KitAnalysis data={result.kitSpanData} /> : <div /> },
     { key: 'util', label: '🔧 设备利用率', disabled: !result, children: result ? <UtilCharts data={result.utilizationData} /> : <div /> },
 
 
-    { key: 'kitboard', label: '📦 齐套看板', disabled: !result, children: result ? <KitDashboard kitData={result.kitSpanData} makespanHours={result.metrics.optimized?.['总完工时间(h)'] ?? result.makespanHours} /> : <div /> },
-    { key: 'buffer', label: '📊 缓存监控', disabled: !result, children: result ? <BufferMonitor stages={result.stagesData} makespanHours={result.makespanHours} bufferTimeseries={result.bufferTimeseries} bufferConfig={result.bufferConfig} deadlockWarnings={(result.metrics.optimized?.['死锁详情'] as unknown) as string[] | undefined} deadlockCount={result.metrics.optimized?.['死锁警告数'] as unknown as number | undefined} /> : <div /> },
-    { key: 'reschedule', label: '⚡ 重调度', disabled: !result, children: result ? <ReschedulePanel runId={activeRunId} currentResult={result} onRescheduled={(gantt, makespan, metrics, stagesData, utilData, bufTs) => {
+    { key: 'reschedule', label: '⚡ 动态响应', disabled: !result, children: result ? <ReschedulePanel runId={activeRunId} currentResult={result} onRescheduled={(gantt, makespan, metrics, stagesData, utilData, kitData, comparisonData, files) => {
       // Update result with all rescheduled data to keep all views in sync
       setResult(prev => prev ? {
         ...prev,
         makespanHours: makespan,
         ganttData: gantt,
-        metrics: { ...prev.metrics, optimized: metrics },
+        metrics: {
+          ...prev.metrics,
+          optimized: metrics,
+          comparison: comparisonData ?? prev.metrics.comparison,
+        },
+        files: files ? { ...prev.files, ...files } : prev.files,
         stagesData: stagesData ?? prev.stagesData,
         utilizationData: utilData ?? prev.utilizationData,
-        bufferTimeseries: bufTs ?? prev.bufferTimeseries,
+        kitSpanData: kitData ?? prev.kitSpanData,
       } : prev);
-    }} /> : <div /> },
-  ], [params, upload, result, prevResult, handleUploaded, activeRunId]);
+      setDynamicGantt(null);
+      setDynamicStages(null);
+      setDynamicMakespan(null);
+      setDynamicFiles(null);
+    }} onPartialResult={(partial, files) => {
+      if (!partial) {
+        setDynamicGantt(null);
+        setDynamicStages(null);
+        setDynamicMakespan(null);
+        setDynamicFiles(null);
+        return;
+      }
+      setDynamicGantt(partial.ganttData);
+      setDynamicStages(partial.stagesData);
+      setDynamicMakespan(partial.makespanHours);
+      setDynamicFiles(files ?? null);
+    }} onDynamicRunningChange={setDynamicRunning} /> : <div /> },
+  ], [params, upload, result, prevResult, handleUploaded, activeRunId, dynamicRunning]);
 
   return (
     <ConfigProvider>
     <div className="app-layout">
       {/* 全屏加载动画 */}
-      <LoadingPipeline visible={loading} progress={loadProgress} />
+      <LoadingPipeline visible={loading} onCancel={handleCancelRun} />
 
       <div className="app-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
@@ -273,6 +303,9 @@ const App: React.FC = () => {
                 <span style={{ fontSize: FONT.sizeXs, color: COLORS.warning, fontWeight: FONT.weightSemibold }}>⚡附件3</span>
               )}
             </Space>
+          )}
+          {lastRunSeconds != null && (
+            <Tag color="blue">本次运行耗时 {formatDuration(lastRunSeconds)}</Tag>
           )}
         </div>
         <Space>

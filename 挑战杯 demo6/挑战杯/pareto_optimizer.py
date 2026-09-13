@@ -9,6 +9,7 @@ import hashlib
 import multiprocessing as mp
 import os
 import threading
+import time
 
 from improved_optimizer import (
     SATabuOptimizer,
@@ -20,6 +21,8 @@ from steel_schedule_model import (
     ModelConfig,
     make_greedy_schedule,
     build_crane_aware_orders,
+    compute_time_budget_seconds,
+    auto_iteration_cap,
     unified_capacity_objective,
     select_best_by_capacity,
     legacy_balanced_objective,
@@ -133,6 +136,7 @@ def run_quadratic_optimization(
     iterations: int = 260,
     progress_callback: object = None,
     parallel_workers: int | None = None,
+    time_budget_seconds: float | None = None,
 ) -> dict:
     """多策略 SA+Tabu + 二次评价入口，返回结构与 run_multi_strategy_inline 一致。"""
     init_solutions = _build_init_orders(features, plates, speed_table, cfg)
@@ -149,7 +153,9 @@ def run_quadratic_optimization(
 
     total_starts = len(init_solutions)
     iter_per_start = max(80, iterations // total_starts)
-    time_per_start = max(30, 120 // total_starts)
+    if time_budget_seconds is None:
+        time_budget_seconds = compute_time_budget_seconds(cfg)
+    time_budget_seconds = max(0.1, float(time_budget_seconds))
 
     all_candidates = []
     all_stats = []
@@ -163,9 +169,14 @@ def run_quadratic_optimization(
     if mp.current_process().name != "MainProcess":
         parallel_workers = 1  # 防止在已有 worker 进程内再次嵌套进程池
     parallel_workers = max(1, min(int(parallel_workers or 1), total_starts))
+    time_per_start = max(0.1, time_budget_seconds * parallel_workers / max(1, total_starts))
+    iter_per_start = auto_iteration_cap(cfg, iter_per_start, time_per_start)
 
     if parallel_workers <= 1:
+        budget_t0 = time.time()
         for start_idx, (name, init_order) in enumerate(init_solutions.items()):
+            if start_idx > 0 and time.time() - budget_t0 > time_budget_seconds:
+                break
             name_hash = int(hashlib.md5(name.encode("utf-8")).hexdigest(), 16) % 100000
             opt = QuadraticSAOptimizer(features, parts, cfg, pp, seed=cfg.random_seed + name_hash)
             opt.fifo_cmax = fifo_baseline_cmax
@@ -282,4 +293,5 @@ def run_quadratic_optimization(
         "opt_metrics": opt_metrics,
         "stages": opt_stages,
         "strategy_name": best_name,
+        "stats": "\n".join(all_stats),
     }

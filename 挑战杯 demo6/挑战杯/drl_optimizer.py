@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import multiprocessing as mp
+import os
 import random
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
@@ -384,6 +387,185 @@ class DRLGuidedOptimizer:
 
 
 # ═══════════════════════════════════════════════════════════
+#  Multiprocessing helpers for DRL-guided multi-start search
+# ═══════════════════════════════════════════════════════════
+
+_DRL_PARALLEL_STATE: dict = {}
+
+
+def _drl_parallel_init(
+    features,
+    parts,
+    cfg,
+    pp,
+    training: bool,
+    iter_per_start: int,
+    time_per_start: float,
+    pri_col: str,
+    cut_col: str,
+):
+    _DRL_PARALLEL_STATE.clear()
+    _DRL_PARALLEL_STATE.update({
+        "features": features,
+        "parts": parts,
+        "cfg": cfg,
+        "pp": pp,
+        "training": bool(training),
+        "iter_per_start": int(iter_per_start),
+        "time_per_start": float(time_per_start),
+        "pri_col": pri_col,
+        "cut_col": cut_col,
+    })
+
+
+def _run_drl_single_start(
+    name: str,
+    base_opt,
+    drl: DRLGuidedOptimizer,
+    init_order: list[str],
+    iter_per_start: int,
+    time_per_start: float,
+    pri_col: str,
+    cut_col: str,
+) -> dict:
+    """Run one DRL-guided SA start; safe to execute inside a worker process."""
+    t0 = time.time()
+    _, init_met, _ = base_opt.schedule_from_order(init_order)
+    current_order = init_order[:]
+    current_met = init_met
+    current_obj = drl.kit_span_objective(init_met)
+    best_local_order = current_order[:]
+    best_local_met = current_met
+    best_local_obj = current_obj
+
+    T = base_opt.T_start
+    no_improve = 0
+    total_iters = 0
+
+    for it in range(iter_per_start):
+        if time.time() - t0 > time_per_start:
+            break
+        total_iters += 1
+
+        operator = drl.select_operator(it, iter_per_start, T)
+
+        if operator == "swap":
+            neighbor = base_opt._swap(current_order)
+        elif operator == "insert":
+            neighbor = base_opt._insert(current_order)
+        elif operator == "block_reverse":
+            neighbor = base_opt._block_reverse(current_order)
+        elif operator == "seg_shuffle":
+            neighbor = base_opt._segment_shuffle(current_order)
+        elif operator == "seg_priority_sort":
+            if len(base_opt.seg_map) >= 2:
+                seg = base_opt.rng.choice(list(base_opt.seg_map.keys()))
+                seg_plates = base_opt.seg_map[seg]
+                if len(seg_plates) >= 3:
+                    seg_features = base_opt.fidx.loc[seg_plates].sort_values(
+                        [pri_col, cut_col], ascending=[True, True]
+                    )
+                    neighbor = current_order[:]
+                    indices = [i for i, n in enumerate(neighbor) if n in seg_plates]
+                    for idx, (plate_name, _) in zip(indices, seg_features.iterrows()):
+                        neighbor[idx] = str(plate_name)
+                else:
+                    neighbor = base_opt._swap(current_order)
+            else:
+                neighbor = base_opt._swap(current_order)
+        elif operator == "balanced_two_opt":
+            hi = max(1, base_opt.n - 30)
+            i = base_opt.rng.randint(0, hi)
+            j = min(base_opt.n, i + base_opt.rng.randint(5, 25))
+            neighbor = current_order[:]
+            neighbor[i:j] = reversed(neighbor[i:j])
+        elif operator == "cross_rebalance":
+            neighbor = base_opt._cross_machine_rebalance(current_order)
+        elif operator == "stagger_crane":
+            neighbor = base_opt._stagger_crane(current_order)
+        elif operator == "kit_cluster":
+            neighbor = base_opt._kit_cluster(current_order)
+        else:
+            neighbor = base_opt._swap(current_order)
+
+        tkey = base_opt._hash_order(neighbor)
+        if tkey in base_opt.tabu:
+            continue
+        base_opt.tabu.add(tkey)
+
+        _, met, _ = base_opt.schedule_from_order(neighbor)
+        new_obj = drl.kit_span_objective(met)
+        delta = new_obj - current_obj
+
+        prev_ks = current_met["加权平均齐套跨度(h)"]
+        new_ks = met["加权平均齐套跨度(h)"]
+        accepted = False
+        _prev_obj = current_obj
+
+        if delta < 0:
+            current_order = neighbor
+            current_met = met
+            current_obj = new_obj
+            accepted = True
+            no_improve = 0
+            if new_obj < best_local_obj:
+                best_local_order = neighbor
+                best_local_met = met
+                best_local_obj = new_obj
+        else:
+            p_accept = math.exp(-delta / max(T, 1e-8))
+            if base_opt.rng.random() < p_accept:
+                current_order = neighbor
+                current_met = met
+                current_obj = new_obj
+                accepted = True
+            no_improve += 1
+
+        drl._last_metrics = met
+        drl.feedback(it, iter_per_start, T, _prev_obj, new_obj, accepted, prev_ks, new_ks)
+
+        T *= base_opt.cooling_rate
+        if no_improve >= base_opt.patience:
+            T = max(T, base_opt.T_start * base_opt.reheat_factor)
+            no_improve = 0
+        T = max(T, base_opt.T_end)
+
+    return {
+        "name": name,
+        "order": best_local_order,
+        "metrics": best_local_met,
+        "best_obj": best_local_obj,
+        "total_iters": total_iters,
+        "epsilon": float(drl.agent.epsilon),
+        "steps": int(drl.agent.total_steps),
+        "init_kit": float(init_met["加权平均齐套跨度(h)"]),
+        "init_cmax": float(init_met["总完工时间(h)"]),
+        "final_kit": float(best_local_met["加权平均齐套跨度(h)"]),
+        "final_cmax": float(best_local_met["总完工时间(h)"]),
+    }
+
+
+def _drl_run_start(job: tuple[str, list[str]]) -> dict:
+    """Worker entry point: run one DRL-guided start."""
+    from improved_optimizer import SATabuOptimizer
+
+    name, init_order = job
+    st = _DRL_PARALLEL_STATE
+    cfg = st["cfg"]
+    name_hash = int(hashlib.md5(name.encode("utf-8")).hexdigest(), 16) % 100000
+    base_opt = SATabuOptimizer(
+        st["features"], st["parts"], cfg, st["pp"],
+        seed=cfg.random_seed + name_hash,
+    )
+    drl = DRLGuidedOptimizer(base_opt, training=st["training"])
+    return _run_drl_single_start(
+        name, base_opt, drl, init_order,
+        st["iter_per_start"], st["time_per_start"],
+        st["pri_col"], st["cut_col"],
+    )
+
+
+# ═══════════════════════════════════════════════════════════
 #  DRL-Enhanced Multi-Start Wrapper
 # ═══════════════════════════════════════════════════════════
 
@@ -397,6 +579,8 @@ def run_drl_enhanced_optimization(
     checks,
     iterations: int = 500,
     training: bool = True,
+    time_budget_seconds: float | None = None,
+    parallel_workers: int | None = None,
 ) -> dict:
     """
     Run DRL-enhanced SA+Tabu optimization.
@@ -437,7 +621,12 @@ def run_drl_enhanced_optimization(
     init_solutions: dict[str, list[str]] = {}
     init_solutions["FIFO"] = features.sort_values(seq_col, kind="stable")[name_col].tolist()
 
-    from steel_schedule_model import make_greedy_schedule, build_crane_aware_orders
+    from steel_schedule_model import (
+        auto_iteration_cap,
+        build_crane_aware_orders,
+        compute_time_budget_seconds,
+        make_greedy_schedule,
+    )
     comp_sched = make_greedy_schedule(features, "completeness", cfg.random_seed)
     # P0-3 修复：空列表安全守卫
     _drl_comp_seq_candidates = [c for c in comp_sched.columns if '序号' in c or '切割序号' in c]
@@ -461,145 +650,79 @@ def run_drl_enhanced_optimization(
     # P0-8 FIX: protect against empty init_solutions (div/0 → ZeroDivisionError)
     n_starts = max(1, len(init_solutions))
     iter_per_start = max(150, iterations // n_starts)
-    time_per_start = max(60, 300 // n_starts)
+    if time_budget_seconds is None:
+        time_budget_seconds = compute_time_budget_seconds(cfg)
+    time_per_start = max(0.1, float(time_budget_seconds) / n_starts)
+    iter_per_start = auto_iteration_cap(cfg, iter_per_start, time_per_start)
 
-    best_order = None
-    best_metrics = None
-    best_obj = float("inf")
-    best_name = ""
+    # 并行策略数：默认用满 CPU，但不超过初始策略数
+    if parallel_workers is None:
+        _env_parallel = os.environ.get("OPTIMIZER_PARALLEL", "1").strip().lower()
+        if _env_parallel in ("0", "false", "no", "off"):
+            parallel_workers = 1
+        else:
+            parallel_workers = min(os.cpu_count() or 1, n_starts)
+    if mp.current_process().name != "MainProcess":
+        parallel_workers = 1
+    parallel_workers = max(1, min(int(parallel_workers or 1), n_starts))
+
+    if parallel_workers > 1:
+        # 多进程按批次执行，时间预算按批次数分摊，尽量用满但不超出。
+        time_per_start = max(0.1, float(time_budget_seconds) * parallel_workers / n_starts)
+    else:
+        time_per_start = max(0.1, float(time_budget_seconds) / n_starts)
+    iter_per_start = auto_iteration_cap(cfg, iter_per_start, time_per_start)
+
+    if parallel_workers > 1:
+        ctx = mp.get_context("spawn" if os.name == "nt" else "fork")
+        pool = ctx.Pool(
+            processes=parallel_workers,
+            initializer=_drl_parallel_init,
+            initargs=(
+                features, parts, cfg, pp, training,
+                iter_per_start, time_per_start, pri_col, cut_col,
+            ),
+        )
+        try:
+            start_results = pool.map(
+                _drl_run_start,
+                list(init_solutions.items()),
+                chunksize=1,
+            )
+        finally:
+            pool.close()
+            pool.join()
+    else:
+        start_results = []
+        budget_t0 = time.time()
+        for start_idx, (name, init_order) in enumerate(init_solutions.items()):
+            if start_idx > 0 and time.time() - budget_t0 > time_budget_seconds:
+                break
+            name_hash = int(hashlib.md5(name.encode("utf-8")).hexdigest(), 16) % 100000
+            base_opt = SATabuOptimizer(features, parts, cfg, pp, seed=cfg.random_seed + name_hash)
+            drl = DRLGuidedOptimizer(base_opt, training=training)
+            start_results.append(
+                _run_drl_single_start(
+                    name, base_opt, drl, init_order,
+                    iter_per_start, time_per_start, pri_col, cut_col,
+                )
+            )
+
+    if not start_results:
+        raise RuntimeError("DRL-guided SA 未产生可用结果")
+
+    best_result = min(start_results, key=lambda r: r["best_obj"])
+    best_name = best_result["name"]
+    best_order = best_result["order"]
+    best_metrics = best_result["metrics"]
     all_drl_agents = []
 
-    for name, init_order in init_solutions.items():
-        import time
-        t0 = time.time()
-
-        # P1-5 修复：使用确定性 MD5 替代非确定性 Python hash()
-        _name_hash = int(hashlib.md5(name.encode('utf-8')).hexdigest(), 16) % 100000
-        base_opt = SATabuOptimizer(features, parts, cfg, pp, seed=cfg.random_seed + _name_hash)
-        drl = DRLGuidedOptimizer(base_opt, training=training)
-
-        # Evaluate initial
-        _, init_met, _ = base_opt.schedule_from_order(init_order)
-        current_order = init_order[:]
-        current_met = init_met
-        current_obj = drl.kit_span_objective(init_met)
-        best_local_order = current_order[:]
-        best_local_met = current_met
-        best_local_obj = current_obj
-
-        T = base_opt.T_start
-        no_improve = 0
-        total_iters = 0
-
-        for it in range(iter_per_start):
-            if time.time() - t0 > time_per_start:
-                break
-            total_iters += 1
-
-            # DRL selects operator and weights
-            operator = drl.select_operator(it, iter_per_start, T)
-
-            # Execute selected operator
-            if operator == "swap":
-                neighbor = base_opt._swap(current_order)
-            elif operator == "insert":
-                neighbor = base_opt._insert(current_order)
-            elif operator == "block_reverse":
-                neighbor = base_opt._block_reverse(current_order)
-            elif operator == "seg_shuffle":
-                neighbor = base_opt._segment_shuffle(current_order)
-            elif operator == "seg_priority_sort":
-                # Sort plates within a random segment by priority then cut time
-                if len(base_opt.seg_map) >= 2:
-                    seg = base_opt.rng.choice(list(base_opt.seg_map.keys()))
-                    seg_plates = base_opt.seg_map[seg]
-                    if len(seg_plates) >= 3:
-                        seg_features = base_opt.fidx.loc[seg_plates].sort_values(
-                            [pri_col, cut_col], ascending=[True, True]
-                        )
-                        neighbor = current_order[:]
-                        indices = [i for i, n in enumerate(neighbor) if n in seg_plates]
-                        for idx, (plate_name, _) in zip(indices, seg_features.iterrows()):
-                            neighbor[idx] = str(plate_name)
-                    else:
-                        neighbor = base_opt._swap(current_order)
-                else:
-                    neighbor = base_opt._swap(current_order)
-            elif operator == "balanced_two_opt":
-                # 2-opt: reverse a subsequence to balance machine loads
-                i = base_opt.rng.randint(0, base_opt.n - 30)
-                j = min(base_opt.n, i + base_opt.rng.randint(5, 25))
-                neighbor = current_order[:]
-                neighbor[i:j] = reversed(neighbor[i:j])
-            elif operator == "cross_rebalance":
-                neighbor = base_opt._cross_machine_rebalance(current_order)
-            elif operator == "stagger_crane":
-                neighbor = base_opt._stagger_crane(current_order)
-            elif operator == "kit_cluster":
-                neighbor = base_opt._kit_cluster(current_order)
-            else:
-                neighbor = base_opt._swap(current_order)
-
-            # Tabu check
-            tkey = base_opt._hash_order(neighbor)
-            if tkey in base_opt.tabu:
-                continue
-            base_opt.tabu.add(tkey)
-
-            # Evaluate
-            _, met, _ = base_opt.schedule_from_order(neighbor)
-            new_obj = drl.kit_span_objective(met)
-            delta = new_obj - current_obj
-
-            prev_ks = current_met["加权平均齐套跨度(h)"]
-            new_ks = met["加权平均齐套跨度(h)"]
-            accepted = False
-
-            # P0-8 FIX: Save prev_obj BEFORE overwriting current_obj, so reward delta is correct
-            _prev_obj = current_obj
-
-            if delta < 0:
-                current_order = neighbor
-                current_met = met
-                current_obj = new_obj
-                accepted = True
-                no_improve = 0
-                if new_obj < best_local_obj:
-                    best_local_order = neighbor
-                    best_local_met = met
-                    best_local_obj = new_obj
-            else:
-                p_accept = math.exp(-delta / max(T, 1e-8))
-                if base_opt.rng.random() < p_accept:
-                    current_order = neighbor
-                    current_met = met
-                    current_obj = new_obj
-                    accepted = True
-                no_improve += 1
-
-            # DRL feedback — use _prev_obj (pre-update) so reward reflects real improvement
-            drl._last_metrics = met
-            drl.feedback(it, iter_per_start, T, _prev_obj, new_obj, accepted, prev_ks, new_ks)
-
-            # Cool + reheat
-            T *= base_opt.cooling_rate
-            if no_improve >= base_opt.patience:
-                T = max(T, base_opt.T_start * base_opt.reheat_factor)
-                no_improve = 0
-            T = max(T, base_opt.T_end)
-
-        # Record best from this start
-        obj = drl.kit_span_objective(best_local_met)
-        if obj < best_obj:
-            best_obj = obj
-            best_metrics = best_local_met
-            best_name = name
-            best_order = best_local_order
-
-        all_drl_agents.append(drl)
-        print(f"  [DRL-{name}] {total_iters} iters, "
-              f"KitSpan={init_met['加权平均齐套跨度(h)']:.2f}h→{best_local_met['加权平均齐套跨度(h)']:.2f}h, "
-              f"Cmax={init_met['总完工时间(h)']:.2f}h→{best_local_met['总完工时间(h)']:.2f}h")
+    for result in start_results:
+        print(
+            f"  [DRL-{result['name']}] {result['total_iters']} iters, "
+            f"KitSpan={result['init_kit']:.2f}h→{result['final_kit']:.2f}h, "
+            f"Cmax={result['init_cmax']:.2f}h→{result['final_cmax']:.2f}h"
+        )
 
     # Build final schedule
     from steel_schedule_model import machine_names, simulate, pick_machine, build_joint_schedule
@@ -636,8 +759,8 @@ def run_drl_enhanced_optimization(
     base_schedule, base_metrics, base_stages = build_schedule(base_order)
 
     # Average DRL stats
-    avg_epsilon = float(np.mean([a.agent.epsilon for a in all_drl_agents]))
-    total_drl_steps = sum(a.agent.total_steps for a in all_drl_agents)
+    avg_epsilon = float(np.mean([r["epsilon"] for r in start_results]))
+    total_drl_steps = sum(int(r["steps"]) for r in start_results)
 
     print(f"[DRL] Best: {best_name}, total DRL steps: {total_drl_steps}, "
           f"final epsilon: {avg_epsilon:.4f}")
@@ -651,6 +774,8 @@ def run_drl_enhanced_optimization(
         "stages": opt_stages,
         "strategy_name": f"DRL-{best_name}",
         "drl_agents": all_drl_agents,
+        "drl_runs": start_results,
+        "stats": f"DRL-{best_name}, steps={total_drl_steps}, epsilon={avg_epsilon:.4f}",
     }
 
 
