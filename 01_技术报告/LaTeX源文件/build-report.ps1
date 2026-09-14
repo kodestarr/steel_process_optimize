@@ -37,7 +37,14 @@ try {
         throw "The compiler did not generate the expected PDF: $pdfFile"
     }
 
-    Write-Host "PDF generated: $pdfFile" -ForegroundColor Green
+    $submissionPdf = Get-ChildItem -LiteralPath (Split-Path -Parent $reportDirectory) -File -Filter '*.pdf' |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $submissionPdf) {
+        throw 'The named submission PDF was not found in the report directory.'
+    }
+    Copy-Item -LiteralPath $pdfFile -Destination $submissionPdf -Force
+
+    Write-Host "PDF generated: $submissionPdf" -ForegroundColor Green
 } finally {
     Pop-Location
 }
