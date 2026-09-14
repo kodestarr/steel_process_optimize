@@ -1,0 +1,2 @@
+# CPU-only PyTorch for offline DQN training and optional DQN seed inference.
+torch>=2.0

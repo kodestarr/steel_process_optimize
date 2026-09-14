@@ -1,0 +1,202 @@
+/* ===== Loading Pipeline Overlay — Billow-inspired ===== */
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(247, 248, 250, 0.92);
+  backdrop-filter: blur(6px);
+}
+
+.loading-card {
+  width: 520px;
+  padding: 48px 40px 36px;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06), 0 1px 4px rgba(0, 0, 0, 0.04);
+  text-align: center;
+}
+
+/* ----- Gear animation ----- */
+.gear-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 80px;
+  margin-bottom: 20px;
+}
+
+.gear {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 5px dashed #3B82F6;
+  animation: spin 3s linear infinite;
+}
+.gear-left  { animation-direction: normal;  border-color: #6366F1; }
+.gear-right { animation-direction: reverse; border-color: #10B981; width: 42px; height: 42px; }
+
+.gear-center {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, #1E3A5F, #3B82F6, #10B981, #F59E0B, #1E3A5F);
+  animation: spin 1.8s linear infinite;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.gear-core {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: inset 0 0 0 3px #1E3A5F;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ----- Title ----- */
+.loading-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #0F172A;
+  margin-bottom: 4px;
+}
+.loading-subtitle {
+  font-size: 13px;
+  color: #64748B;
+  margin-bottom: 28px;
+}
+
+/* ----- Progress bar track ----- */
+.pipeline-track {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: #E2E8F0;
+  overflow: hidden;
+  margin-bottom: 32px;
+}
+
+.pipeline-fill {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #3B82F6, #10B981, #F59E0B, #3B82F6);
+  background-size: 300% 100%;
+  animation: gradientFlow 2.4s ease-in-out infinite;
+  overflow: hidden;
+}
+
+.pipeline-shimmer {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.5) 50%, transparent 100%);
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes gradientFlow {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+@keyframes shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* ----- Flow particles ----- */
+.flow-particle {
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  animation: particleFlow 2s ease-in-out infinite;
+  opacity: 0;
+}
+.flow-particle.p1 { background: #3B82F6; animation-delay: 0s; }
+.flow-particle.p2 { background: #10B981; animation-delay: 0.5s; }
+.flow-particle.p3 { background: #F59E0B; animation-delay: 1.0s; }
+
+@keyframes particleFlow {
+  0%   { left: 0%; opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+  10%  { opacity: 1; }
+  30%  { opacity: 1; transform: translate(-50%, -50%) scale(1.2); }
+  60%  { opacity: 0.6; }
+  90%  { left: 100%; opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+  100% { left: 100%; opacity: 0; }
+}
+
+/* ----- Stage indicators ----- */
+.stage-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.stage-dot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  position: relative;
+  opacity: 0.35;
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+.stage-dot.active { opacity: 1; transform: scale(1.1); }
+.stage-dot.done   { opacity: 0.8; }
+
+/* Connector lines */
+.stage-dot:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  top: 18px;
+  left: 55%;
+  width: 90%;
+  height: 2px;
+  background: #E2E8F0;
+  transition: background 0.5s ease;
+}
+.stage-dot.done:not(:last-child)::after {
+  background: #3B82F6;
+}
+
+.stage-icon {
+  font-size: 28px;
+  line-height: 1;
+  transition: filter 0.3s ease;
+}
+.stage-dot.active .stage-icon {
+  animation: iconBounce 0.6s ease;
+}
+
+@keyframes iconBounce {
+  0%, 100% { transform: translateY(0); }
+  30%      { transform: translateY(-6px); }
+  50%      { transform: translateY(0); }
+  70%      { transform: translateY(-3px); }
+}
+
+.stage-label {
+  font-size: 11px;
+  color: #64748B;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.stage-dot.active .stage-label {
+  color: #0F172A;
+  font-weight: 700;
+}

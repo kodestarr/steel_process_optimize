@@ -1,0 +1,342 @@
+{
+  "phase": 2,
+  "config": "Balanced",
+  "timestamp": "2026-08-09T18:45:59.468463",
+  "results": [
+    {
+      "label": "Balanced",
+      "dataset": "data_0",
+      "n_plates": 109,
+      "n_parts": 910,
+      "n_kits": 21,
+      "strategy": "SegPriShort",
+      "elapsed_s": 136.2,
+      "config": {
+        "obj_weight_cmax": 0.4,
+        "obj_weight_kit": 0.4,
+        "obj_weight_load": 0.2,
+        "iterations": 600,
+        "cutting_machines": 2,
+        "auto_bevel": 1,
+        "manual_bevel": 1,
+        "large_grinders": 2
+      },
+      "metrics": {
+        "总完工时间(h)": {
+          "base": 79.3148,
+          "opt": 79.953,
+          "pct": -0.8
+        },
+        "加权平均齐套跨度(h)": {
+          "base": 30.8281,
+          "opt": 13.6749,
+          "pct": 55.64
+        },
+        "最大齐套跨度(h)": {
+          "base": 73.3057,
+          "opt": 71.9173,
+          "pct": 1.89
+        },
+        "切割负载差(h)": {
+          "base": 0.6518,
+          "opt": 0.2906,
+          "pct": 55.42
+        },
+        "整体产能(张板/班)": {
+          "base": 10.9942,
+          "opt": 10.9064,
+          "pct": -0.8
+        },
+        "切割机综合稼动率": {
+          "base": 0.8787,
+          "opt": 0.8717,
+          "pct": -0.8
+        },
+        "AGV路径冲突次数": {
+          "base": 12,
+          "opt": 10,
+          "pct": 16.67
+        },
+        "死锁警告数": {
+          "base": 0,
+          "opt": 0,
+          "pct": 0.0
+        }
+      },
+      "targets": {
+        "Cmax_to_target_h": 12.7,
+        "KitSpan_to_target_h": 0.97,
+        "LoadDiff_to_target_h": -0.71
+      },
+      "composite_score": 27.4
+    },
+    {
+      "label": "Balanced",
+      "dataset": "data_1",
+      "n_plates": 55,
+      "n_parts": 692,
+      "n_kits": 18,
+      "strategy": "FIFO-archive",
+      "elapsed_s": 133.4,
+      "config": {
+        "obj_weight_cmax": 0.4,
+        "obj_weight_kit": 0.4,
+        "obj_weight_load": 0.2,
+        "iterations": 600,
+        "cutting_machines": 2,
+        "auto_bevel": 2,
+        "manual_bevel": 4,
+        "large_grinders": 2
+      },
+      "metrics": {
+        "总完工时间(h)": {
+          "base": 143.2458,
+          "opt": 157.7078,
+          "pct": -10.1
+        },
+        "加权平均齐套跨度(h)": {
+          "base": 44.6755,
+          "opt": 17.4186,
+          "pct": 61.01
+        },
+        "最大齐套跨度(h)": {
+          "base": 105.7148,
+          "opt": 87.9621,
+          "pct": 16.79
+        },
+        "切割负载差(h)": {
+          "base": 1.0829,
+          "opt": 2.3616,
+          "pct": -118.08
+        },
+        "整体产能(张板/班)": {
+          "base": 3.0716,
+          "opt": 2.79,
+          "pct": -9.17
+        },
+        "切割机综合稼动率": {
+          "base": 0.5085,
+          "opt": 0.4619,
+          "pct": -9.17
+        },
+        "AGV路径冲突次数": {
+          "base": 16,
+          "opt": 20,
+          "pct": -25.0
+        },
+        "死锁警告数": {
+          "base": 0,
+          "opt": 0,
+          "pct": 0.0
+        }
+      },
+      "targets": {
+        "Cmax_to_target_h": 90.46,
+        "KitSpan_to_target_h": 4.72,
+        "LoadDiff_to_target_h": 1.36
+      },
+      "composite_score": 7.59
+    },
+    {
+      "label": "Balanced",
+      "dataset": "data_2",
+      "n_plates": 218,
+      "n_parts": 4189,
+      "n_kits": 36,
+      "strategy": "SPT",
+      "elapsed_s": 200.6,
+      "config": {
+        "obj_weight_cmax": 0.4,
+        "obj_weight_kit": 0.4,
+        "obj_weight_load": 0.2,
+        "iterations": 600,
+        "cutting_machines": 2,
+        "auto_bevel": 3,
+        "manual_bevel": 6,
+        "large_grinders": 2
+      },
+      "metrics": {
+        "总完工时间(h)": {
+          "base": 849.0462,
+          "opt": 861.0497,
+          "pct": -1.41
+        },
+        "加权平均齐套跨度(h)": {
+          "base": 365.0812,
+          "opt": 124.2397,
+          "pct": 65.97
+        },
+        "最大齐套跨度(h)": {
+          "base": 845.296,
+          "opt": 746.6953,
+          "pct": 11.66
+        },
+        "切割负载差(h)": {
+          "base": 4.746,
+          "opt": 5.6343,
+          "pct": -18.72
+        },
+        "整体产能(张板/班)": {
+          "base": 2.0541,
+          "opt": 2.0254,
+          "pct": -1.39
+        },
+        "切割机综合稼动率": {
+          "base": 0.4574,
+          "opt": 0.451,
+          "pct": -1.39
+        },
+        "AGV路径冲突次数": {
+          "base": 34,
+          "opt": 35,
+          "pct": -2.94
+        },
+        "死锁警告数": {
+          "base": 0,
+          "opt": 0,
+          "pct": 0.0
+        }
+      },
+      "targets": {
+        "Cmax_to_target_h": 793.8,
+        "KitSpan_to_target_h": 111.54,
+        "LoadDiff_to_target_h": 4.63
+      },
+      "composite_score": 23.81
+    },
+    {
+      "label": "Balanced",
+      "dataset": "data_3",
+      "n_plates": 150,
+      "n_parts": 2939,
+      "n_kits": 56,
+      "strategy": "SegPriShort",
+      "elapsed_s": 190.8,
+      "config": {
+        "obj_weight_cmax": 0.4,
+        "obj_weight_kit": 0.4,
+        "obj_weight_load": 0.2,
+        "iterations": 600,
+        "cutting_machines": 2,
+        "auto_bevel": 3,
+        "manual_bevel": 6,
+        "large_grinders": 2
+      },
+      "metrics": {
+        "总完工时间(h)": {
+          "base": 615.3461,
+          "opt": 609.1838,
+          "pct": 1.0
+        },
+        "加权平均齐套跨度(h)": {
+          "base": 164.5714,
+          "opt": 93.2076,
+          "pct": 43.36
+        },
+        "最大齐套跨度(h)": {
+          "base": 597.0914,
+          "opt": 390.7339,
+          "pct": 34.56
+        },
+        "切割负载差(h)": {
+          "base": 2.3925,
+          "opt": 5.731,
+          "pct": -139.54
+        },
+        "整体产能(张板/班)": {
+          "base": 1.9501,
+          "opt": 1.9698,
+          "pct": 1.01
+        },
+        "切割机综合稼动率": {
+          "base": 0.4142,
+          "opt": 0.4184,
+          "pct": 1.01
+        },
+        "AGV路径冲突次数": {
+          "base": 53,
+          "opt": 54,
+          "pct": -1.89
+        },
+        "死锁警告数": {
+          "base": 1,
+          "opt": 0,
+          "pct": 100.0
+        }
+      },
+      "targets": {
+        "Cmax_to_target_h": 541.93,
+        "KitSpan_to_target_h": 80.51,
+        "LoadDiff_to_target_h": 4.73
+      },
+      "composite_score": 3.89
+    },
+    {
+      "label": "Balanced",
+      "dataset": "data_4",
+      "n_plates": 80,
+      "n_parts": 1310,
+      "n_kits": 20,
+      "strategy": "SegPriLong-archive",
+      "elapsed_s": 184.4,
+      "config": {
+        "obj_weight_cmax": 0.4,
+        "obj_weight_kit": 0.4,
+        "obj_weight_load": 0.2,
+        "iterations": 600,
+        "cutting_machines": 2,
+        "auto_bevel": 3,
+        "manual_bevel": 6,
+        "large_grinders": 2
+      },
+      "metrics": {
+        "总完工时间(h)": {
+          "base": 418.6774,
+          "opt": 434.2608,
+          "pct": -3.72
+        },
+        "加权平均齐套跨度(h)": {
+          "base": 106.574,
+          "opt": 33.264,
+          "pct": 68.79
+        },
+        "最大齐套跨度(h)": {
+          "base": 359.7261,
+          "opt": 195.5967,
+          "pct": 45.63
+        },
+        "切割负载差(h)": {
+          "base": 3.9546,
+          "opt": 3.4735,
+          "pct": 12.17
+        },
+        "整体产能(张板/班)": {
+          "base": 1.5286,
+          "opt": 1.4738,
+          "pct": -3.59
+        },
+        "切割机综合稼动率": {
+          "base": 0.5131,
+          "opt": 0.4947,
+          "pct": -3.59
+        },
+        "AGV路径冲突次数": {
+          "base": 20,
+          "opt": 22,
+          "pct": -10.0
+        },
+        "死锁警告数": {
+          "base": 0,
+          "opt": 0,
+          "pct": 0.0
+        }
+      },
+      "targets": {
+        "Cmax_to_target_h": 367.01,
+        "KitSpan_to_target_h": 20.56,
+        "LoadDiff_to_target_h": 2.47
+      },
+      "composite_score": 26.88
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "state_format_version": 3,
+  "version": 1,
+  "decision_time_min": 480.0,
+  "decision_time": "08:00:00",
+  "faults": [
+    {
+      "id": "FAULT-N2-HEAD-1",
+      "resource_id": "head:N2",
+      "start_min": 480.0,
+      "end_min": 720.0,
+      "start_time": "08:00:00",
+      "duration": "04:00:00",
+      "end_time": null,
+      "status": "active"
+    }
+  ],
+  "order_changes": [
+    {
+      "plate_name": "A03S-1292",
+      "action": "cancel"
+    },
+    {
+      "plate_name": "A03S-1303",
+      "action": "priority",
+      "priority": 0
+    }
+  ],
+  "order_change_time": null,
+  "strategy_mode": "sa_tabu",
+  "remaining_model": "sa_tabu",
+  "strategy_reason": "首板快速锁定后，使用 SA+Tabu 在剩余时间预算内优化其余钢板",
+  "input_path": "03_赛题与输入数据/附件2：钢板零件数据.xlsx",
+  "speed_table_path": "03_赛题与输入数据/附件3：工艺用时计算表.xlsx",
+  "input_file_id": null,
+  "speed_file_id": null,
+  "input_filename": "附件2：钢板零件数据.xlsx",
+  "last_simulation_ms": 440.681,
+  "data_change_summary": {
+    "added_plates": [],
+    "removed_plates": [],
+    "common_plates": 109
+  },
+  "updated_at": "2026-09-13T00:35:44"
+}
