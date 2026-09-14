@@ -271,13 +271,13 @@ def process_flow() -> None:
     box_h = 145
     gap = 55
     small_boxes = [
-        (130, lane_y, 860, lane_y + box_h, "小件分拣与打磨", "桁架分侧；2L/v + 视觉扫描"),
+        (130, lane_y, 860, lane_y + box_h, "小件链路：分拣与打磨", "桁架分侧；2L/v + 视觉扫描"),
         (130, lane_y + box_h + gap, 860, lane_y + 2 * box_h + gap, "自动坡口与料框码垛", "Y/v + (X+K)/v + 3.5 min；坡口件分框"),
         (130, lane_y + 2 * (box_h + gap), 860, lane_y + 3 * box_h + 2 * gap, "AGV 转运至半框缓存", "N2/N5 料框按分段和优先级转运"),
         (130, lane_y + 3 * (box_h + gap), 860, lane_y + 4 * box_h + 3 * gap, "小件分段齐套", "同分段全部小件到位后进入小部材放置区"),
     ]
     large_boxes = [
-        (1040, lane_y, 1770, lane_y + box_h, "胎架自由边打磨", "L / 1950 mm/min"),
+        (1040, lane_y, 1770, lane_y + box_h, "大件链路：胎架自由边打磨", "L / 1950 mm/min"),
         (1040, lane_y + box_h + gap, 1770, lane_y + 2 * box_h + gap, "天车成组转运", "胎架 -> 人工坡口区"),
         (1040, lane_y + 2 * (box_h + gap), 1770, lane_y + 3 * box_h + 2 * gap, "人工坡口", "Y+X+K / 250 mm/min"),
         (1040, lane_y + 3 * (box_h + gap), 1770, lane_y + 4 * box_h + 3 * gap, "成品放置区", "大件不进入小件分段齐套链路"),
@@ -297,10 +297,8 @@ def process_flow() -> None:
     branch_y = split_y + 42
     draw.line((split_x, split_y, split_x, branch_y), fill=COLORS["ink"], width=5)
     draw.line((495, branch_y, 1405, branch_y), fill=COLORS["ink"], width=5)
-    arrow(draw, (495, branch_y), (495, lane_y), color=COLORS["teal"], width=5, head=13)
-    arrow(draw, (1405, branch_y), (1405, lane_y), color=COLORS["gold"], width=5, head=13)
-    draw.text((130, 405), "小件链路", font=font(30, True), fill=COLORS["teal"])
-    draw.text((1040, 405), "大件链路", font=font(30, True), fill=COLORS["gold"])
+    arrow(draw, (495, branch_y), (495, small_boxes[0][1]), color=COLORS["teal"], width=5, head=13)
+    arrow(draw, (1405, branch_y), (1405, large_boxes[0][1]), color=COLORS["gold"], width=5, head=13)
 
     image.save(ASSET_DIR / "process_flow.png", quality=95)
 
@@ -695,7 +693,7 @@ def evaluation_function_map() -> None:
             80,
             590,
             "产能优先标量",
-            "J=Cmax/LB+\nε·Secondary",
+            "J = C / LB + ε × S",
             "交期优先，允许在1%产能带内微调齐套与负载",
             COLORS["blue_light"],
             COLORS["blue"],
@@ -704,7 +702,7 @@ def evaluation_function_map() -> None:
             500,
             590,
             "三指标平衡",
-            "J=wC·Cnorm+\nwK·Knorm+wL·Lnorm",
+            "J = w1 × Cnorm +\nw2 × Knorm + w3 × Lnorm",
             "计划员常用，选项直观，适合单解交付",
             COLORS["teal_light"],
             COLORS["teal"],
@@ -713,7 +711,7 @@ def evaluation_function_map() -> None:
             920,
             590,
             "二次惩罚",
-            "J=wC·c²+wK·k²+\nwL·l²+越界项",
+            "J = w1 × c² + w2 × k² +\nw3 × l² + penalty",
             "超出目标或 FIFO 的代价显著放大，适合约束敏感场景",
             COLORS["gold_light"],
             COLORS["gold"],
@@ -722,7 +720,7 @@ def evaluation_function_map() -> None:
             1340,
             590,
             "Pareto 向量",
-            "F=[Cmax/LB,\nK/FIFO,ΔL/FIFO,W/FIFO]",
+            "F = [C / LB, K / K0,\nΔL / ΔL0, W / W0]",
             "不预先压权重，输出完整前沿，适合多部门协商",
             COLORS["red_light"],
             COLORS["red"],

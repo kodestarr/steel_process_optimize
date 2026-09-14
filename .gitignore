@@ -51,6 +51,21 @@ drl_qtable.npy
 **/drl_qtable.npy
 *.npy
 **/*.npy
+
+# LaTeX build artifacts
+*.aux
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+**/main.pdf
+
 新建 文本文档.txt
 挑战杯 demo6/挑战杯/frontend/C*
 

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import math
 import multiprocessing as mp
 import os
@@ -117,6 +118,8 @@ class GeneticLNSOptimizer(SATabuOptimizer):
         self._pool = None
         self._seen_archive = set()
         self._metrics_cache: dict[str, dict] = {}
+        self._metrics_cache_max = 800
+        self._seen_archive_max = 4000
 
     # ── 分段成块辅助 ──────────────────────────────────────
     def _seg_of(self, plate_name: str) -> str:
@@ -176,6 +179,8 @@ class GeneticLNSOptimizer(SATabuOptimizer):
         met = self._metrics_cache.get(key)
         if met is None:
             _, met, _ = self.schedule_from_order(order)
+            if len(self._metrics_cache) >= self._metrics_cache_max:
+                self._metrics_cache.pop(next(iter(self._metrics_cache)))
             self._metrics_cache[key] = met
         return order, met, self._fitness(met)
 
@@ -194,8 +199,12 @@ class GeneticLNSOptimizer(SATabuOptimizer):
             results = self._pool.map(_ga_eval_worker, unique)
         for order, met, _obj in results:
             key = self._hash_order(order)
+            if key not in self._metrics_cache and len(self._metrics_cache) >= self._metrics_cache_max:
+                self._metrics_cache.pop(next(iter(self._metrics_cache)))
             self._metrics_cache[key] = met
             if key not in self._seen_archive:
+                if len(self._seen_archive) >= self._seen_archive_max:
+                    self._seen_archive.clear()
                 self._seen_archive.add(key)
                 self._update_pareto_archive(order[:], met)
         return results
@@ -404,6 +413,51 @@ class GeneticLNSOptimizer(SATabuOptimizer):
                         best_obj = obj
         return best_order, best_met, best_obj
 
+    def _lns_batch(
+        self,
+        elites: list[tuple[list[str], dict, float]],
+        t0: float,
+        time_limit_seconds: float,
+    ) -> tuple[list[tuple[list[str], dict, float]], set[int], int]:
+        """批量生成 LNS 候选并统一交给进程池评估，避免精英精修串行。"""
+        states = [(order[:], met, obj) for order, met, obj in elites]
+        improved: set[int] = set()
+        lns_iterations = max(1, int(getattr(self.cfg, "lns_iterations", 4)))
+        total_candidates = 0
+        for iteration in range(lns_iterations):
+            if time.time() - t0 > time_limit_seconds * 0.95:
+                break
+            candidate_meta: list[tuple[int, list[str]]] = []
+            for elite_idx, (order, _met, _obj) in enumerate(states):
+                base, removed = self._destroy(order)
+                candidate_meta.append((elite_idx, self._repair_heuristic(base, removed)))
+                candidate_meta.append((elite_idx, self._repair_random(base, removed)))
+            if not candidate_meta:
+                break
+            evaluated = self._evaluate_many([candidate for _, candidate in candidate_meta])
+            total_candidates += len(evaluated)
+            result_map = {
+                self._hash_order(order): (order, met, obj)
+                for order, met, obj in evaluated
+            }
+            candidate_by_elite: dict[int, list[tuple[list[str], dict, float]]] = {}
+            for elite_idx, candidate in candidate_meta:
+                result = result_map.get(self._hash_order(self._enforce_first_plate(candidate)))
+                if result is not None:
+                    candidate_by_elite.setdefault(elite_idx, []).append(result)
+            for elite_idx, candidates in candidate_by_elite.items():
+                best_order, best_met, best_obj = states[elite_idx]
+                for candidate_order, candidate_met, candidate_obj in candidates:
+                    if candidate_obj < best_obj - 1e-9:
+                        best_order, best_met, best_obj = candidate_order, candidate_met, candidate_obj
+                        improved.add(elite_idx)
+                    else:
+                        temp = max(0.1, 5.0 * (1.0 - iteration / max(1, lns_iterations)))
+                        if self.rng.random() < math.exp(-(candidate_obj - best_obj) / temp):
+                            best_order, best_met, best_obj = candidate_order, candidate_met, candidate_obj
+                states[elite_idx] = (best_order, best_met, best_obj)
+        return states, improved, total_candidates
+
     def _eval_metrics(self, order: list[str]) -> dict:
         order = self._enforce_first_plate(order)
         key = self._hash_order(order)
@@ -458,6 +512,7 @@ class GeneticLNSOptimizer(SATabuOptimizer):
         total_evals = 0
         completed_generations = 0
         time_limit_reached = False
+        generation_durations: list[float] = []
         try:
             population = self._build_initial_population(initial_order)
             population = self._evaluate_many(population)
@@ -466,9 +521,16 @@ class GeneticLNSOptimizer(SATabuOptimizer):
             best_order, best_met, best_obj = population[0]
 
             for gen in range(generations):
-                if time.time() - t0 > time_limit_seconds:
+                elapsed = time.time() - t0
+                if elapsed >= time_limit_seconds * 0.95:
                     time_limit_reached = True
                     break
+                if generation_durations:
+                    avg_generation = sum(generation_durations[-3:]) / len(generation_durations[-3:])
+                    if elapsed + avg_generation > time_limit_seconds * 0.95:
+                        time_limit_reached = True
+                        break
+                generation_started = time.time()
                 offspring = self._generate_offspring(population, gen)
                 total_evals += len(offspring)
                 merged = population + offspring
@@ -477,19 +539,20 @@ class GeneticLNSOptimizer(SATabuOptimizer):
 
                 # GA 为主，LNS 对精英个体做局部精修
                 elite_count = max(2, pop_size // 4)
-                lns_improved = 0
-                for elite_order, _met, elite_obj in population[:elite_count]:
-                    new_order, new_met, new_obj = self._lns_search(
-                        elite_order, elite_obj, t0, time_limit_seconds
-                    )
-                    total_evals += 2  # LNS 每次迭代生成两个候选并评估
-                    if new_obj < elite_obj - 1e-9:
-                        lns_improved += 1
-                        population.append((new_order, new_met, new_obj))
-                        self._update_pareto_archive(new_order[:], new_met)
+                lns_states, lns_improved_indices, lns_eval_count = self._lns_batch(
+                    population[:elite_count],
+                    t0,
+                    time_limit_seconds,
+                )
+                total_evals += lns_eval_count
+                for elite_idx in sorted(lns_improved_indices):
+                    new_order, new_met, new_obj = lns_states[elite_idx]
+                    population.append((new_order, new_met, new_obj))
+                    self._update_pareto_archive(new_order[:], new_met)
                 population.sort(key=lambda x: x[2])
                 population = population[:pop_size]
                 completed_generations += 1
+                generation_durations.append(max(0.0, time.time() - generation_started))
 
                 if population[0][2] < best_obj - 1e-9:
                     best_order, best_met, best_obj = population[0]
@@ -507,8 +570,17 @@ class GeneticLNSOptimizer(SATabuOptimizer):
 
         final_order, final_met = self._select_final(best_order, best_met)
         elapsed = time.time() - t0
+        avg_gen_time = (
+            sum(generation_durations) / len(generation_durations)
+            if generation_durations else 0.0
+        )
+        estimated_generations = (
+            int(time_limit_seconds / avg_gen_time)
+            if avg_gen_time > 0 else 0
+        )
         stats = (
             f"GA+LNS: {completed_generations}/{generations} gens, {total_evals} evals, {elapsed:.1f}s, "
+            f"avg-gen={avg_gen_time:.2f}s, estimated-total≈{estimated_generations} gens, "
             f"{'time_limit' if time_limit_reached else 'completed'} | "
             f"Cmax: {best_met['总完工时间(h)']:.2f}h -> {final_met['总完工时间(h)']:.2f}h, "
             f"KitSpan: {best_met['加权平均齐套跨度(h)']:.2f}h -> {final_met['加权平均齐套跨度(h)']:.2f}h"
@@ -572,14 +644,43 @@ def run_ga_lns_optimization(
         parallel_workers = (
             1
             if env in ("0", "false", "no", "off")
-            else min(os.cpu_count() or 1, max(4, int(getattr(cfg, "ga_population_size", 16))))
+            else min(os.cpu_count() or 1, 32)
         )
     if mp.current_process().name != "MainProcess":
         parallel_workers = 1
     parallel_workers = max(1, int(parallel_workers or 1))
 
-    builder = SATabuOptimizer(features, parts, cfg, pp, seed=cfg.random_seed)
+    if time_budget_seconds is None:
+        time_budget_seconds = compute_time_budget_seconds(cfg)
+    time_limit = max(0.1, float(time_budget_seconds))
+
+    ga_cfg = copy.deepcopy(cfg)
+    user_pop = max(4, int(getattr(cfg, "ga_population_size", 16)))
+    if bool(getattr(cfg, "time_priority_mode", True)) and math.isfinite(time_limit):
+        # 让每个并行 worker 至少有 8 个候选，减少小种群导致的 CPU 闲置。
+        ga_cfg.ga_population_size = min(
+            256,
+            max(user_pop, int(parallel_workers) * 8),
+        )
+
+    builder = SATabuOptimizer(features, parts, ga_cfg, pp, seed=cfg.random_seed)
+    calibrate_started = time.perf_counter()
     _, fifo_met, _ = builder.schedule_from_order(fifo_order)
+    serial_eval_seconds = max(1e-4, time.perf_counter() - calibrate_started)
+    estimated_parallel_eval_per_second = (
+        max(1.0, float(parallel_workers) * 0.8) / serial_eval_seconds
+    )
+    estimated_total_evals = max(
+        ga_cfg.ga_population_size,
+        int(time_limit * estimated_parallel_eval_per_second),
+    )
+    estimated_generations = max(
+        1,
+        int(
+            (estimated_total_evals - ga_cfg.ga_population_size)
+            / max(1, ga_cfg.ga_population_size)
+        ),
+    )
     fifo_cmax = fifo_met["总完工时间(h)"]
     fifo_kit = fifo_met["加权平均齐套跨度(h)"]
     fifo_load = fifo_met["切割负载差(h)"]
@@ -588,7 +689,7 @@ def run_ga_lns_optimization(
     opt = GeneticLNSOptimizer(
         features,
         parts,
-        cfg,
+        ga_cfg,
         pp,
         seed=cfg.random_seed,
         objective_type=objective_type,
@@ -601,29 +702,35 @@ def run_ga_lns_optimization(
     opt.fifo_load_diff = fifo_load
     opt.fifo_waiting = fifo_waiting
 
-    # 时间预算按“最大计算时间 × 0.95”执行；仅在每代开始处检查，保证当前代完整结束。
-    if time_budget_seconds is None:
-        time_budget_seconds = compute_time_budget_seconds(cfg)
-    time_limit = max(0.1, float(time_budget_seconds))
-
     def _wrap_cb(it, mx, cur, best, T):
         if progress_callback:
             progress_callback(it, mx, cur, best, T)
 
+    generation_cap = min(
+        auto_generation_cap(
+            ga_cfg,
+            int(getattr(ga_cfg, "ga_generations", 10)),
+            time_limit,
+            seconds_per_generation=0.5,
+        ),
+        estimated_generations,
+    )
     order, metrics, stats = opt.optimize(
         fifo_order,
         max_iterations=iterations,
         time_limit_seconds=time_limit,
         verbose=False,
         progress_callback=_wrap_cb if progress_callback else None,
-        generation_cap=auto_generation_cap(
-            cfg,
-            int(getattr(cfg, "ga_generations", 10)),
-            time_limit,
-            seconds_per_generation=1.0,
-        ),
+        generation_cap=generation_cap,
+    )
+    stats = (
+        f"workers={parallel_workers}, population={ga_cfg.ga_population_size}, "
+        f"eval≈{estimated_parallel_eval_per_second:.1f}/s, "
+        f"estimated-generations={estimated_generations}, "
+        f"time-budget={time_limit:.1f}s | {stats}"
     )
 
+    builder._eval_cache.clear()
     opt_schedule, opt_metrics, opt_stages = builder.schedule_from_order(order)
     base_schedule, base_metrics, base_stages = builder.schedule_from_order(fifo_order)
 

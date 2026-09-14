@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -765,6 +766,7 @@ async def run_model(payload: dict):
         return await run_in_threadpool(
             lambda: asyncio.run(run_model({**payload, "_in_thread": True}))
         )
+    run_started = time.perf_counter()
     file_id = payload.get("file_id")
     if not file_id:
         raise HTTPException(400, "缺少 file_id")
@@ -894,6 +896,7 @@ async def run_model(payload: dict):
         _run_cancel_flags.discard(client_token)
 
     result_store.commit(out_dir, static_job_id)
+    run_duration_s = round(time.perf_counter() - run_started, 3)
 
     # 记录历史（P1-1 修复：原子化读-改-写）
     _atomic_history_update(lambda h: h["runs"].insert(0, {
@@ -907,9 +910,12 @@ async def run_model(payload: dict):
         "score": _history_score(result["metrics"]["optimized"], result["metrics"].get("fifo", {})),
         "algorithm_name": result.get("algorithmName", _optimizer_display_name(cfg)),
         "optimized_metrics": result["metrics"]["optimized"],
+        "run_duration_s": run_duration_s,
     }) or h)
 
     result["run_id"] = run_id
+    result["run_duration_s"] = run_duration_s
+    balanced_result["run_duration_s"] = run_duration_s
     _file_map = {
         "schedule_csv": "optimized_plate_schedule.csv",
         "completion_csv": "part_completion.csv",
@@ -1164,6 +1170,7 @@ def _history_report_payload(
 
     return {
         "run_id": run_id,
+        "run_duration_s": history_entry.get("run_duration_s"),
         "algorithmName": stored_name,
         "metrics": {
             "fifo": stored_base,
@@ -1219,6 +1226,7 @@ async def get_run_detail(run_id: str):
             balanced_payload["algorithmName"] = f"{balanced_payload.get('algorithmName', stored_name)}（兼顾三指标/Pareto综合选解）"
         else:
             balanced_payload["algorithmName"] = f"{balanced_payload.get('algorithmName', stored_name)}（兼顾三指标/原评价）"
+        balanced_payload["run_duration_s"] = capacity_payload.get("run_duration_s")
         balanced_payload["reportMode"] = "balanced"
         capacity_report = dict(capacity_payload)
         capacity_payload["reports"] = {

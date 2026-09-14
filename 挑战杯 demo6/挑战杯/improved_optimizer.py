@@ -119,8 +119,9 @@ class SATabuOptimizer:
         self._archive_max_size = 50  # keep top 50 non-dominated solutions
 
         # Evaluation cache (bounded to prevent memory growth)
+        # 优化迭代只缓存轻量指标，避免长跑时保存数千份完整工序表导致内存耗尽。
         self._eval_cache: dict[str, tuple] = {}
-        self._eval_cache_max = 5000
+        self._eval_cache_max = 300
 
     # ── Schedule builder ──────────────────────────────────
     def _enforce_first_plate(self, order: list[str]) -> list[str]:
@@ -150,7 +151,8 @@ class SATabuOptimizer:
         order_names = self._enforce_first_plate(order_names)
         key = self._hash_order(order_names, machine_assignments)
         if key in self._eval_cache:
-            return self._eval_cache[key]
+            cached_schedule, cached_metrics = self._eval_cache[key]
+            return cached_schedule, cached_metrics, pd.DataFrame()
         # Evict oldest entries if cache exceeds limit
         if len(self._eval_cache) >= self._eval_cache_max:
             evict_count = len(self._eval_cache) // 4
@@ -239,9 +241,8 @@ class SATabuOptimizer:
         new_sched, _, _, met, stg, _ = build_joint_schedule(
             sched, self.parts, self.cfg, self.pp,
         )
-        result = (new_sched, met, stg)
-        self._eval_cache[key] = result
-        return result
+        self._eval_cache[key] = (new_sched, met)
+        return new_sched, met, stg
 
     @staticmethod
     def _hash_order(
@@ -1097,6 +1098,7 @@ def run_multi_strategy_inline(
     _builder.fifo_kit_span = fifo_baseline_kit
     _builder.fifo_load_diff = fifo_baseline_load
     _builder.fifo_waiting = fifo_baseline_waiting
+    _builder._eval_cache.clear()
 
     opt_schedule, opt_metrics, opt_stages = _builder.schedule_from_order(best_order)
     base_order = init_solutions["FIFO"]

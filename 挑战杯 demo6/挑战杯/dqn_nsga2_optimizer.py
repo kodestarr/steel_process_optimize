@@ -634,9 +634,11 @@ def run_dq_nsga2_pareto_front(
     if capacity_rec is None or balanced_rec is None:
         raise RuntimeError("DQN+NSGA-II 未产生 Pareto 前沿解")
 
+    fifo_builder._eval_cache.clear()
     cap_schedule, cap_metrics, cap_stages = fifo_builder.schedule_from_order(
         capacity_rec["order"], capacity_rec["machine_map"]
     )
+    fifo_builder._eval_cache.clear()
     bal_schedule, bal_metrics, bal_stages = fifo_builder.schedule_from_order(
         balanced_rec["order"], balanced_rec["machine_map"]
     )

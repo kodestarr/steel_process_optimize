@@ -50,6 +50,10 @@ function formatDuration(totalSeconds: number): string {
   return `${Math.floor(m / 60)}h ${m % 60}m ${rs}s`;
 }
 
+function normalizeRunDuration(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 const App: React.FC = () => {
   const [upload, setUpload] = useState<UploadResponse | null>(null);
   const [params, setParams] = useState<ModelParams>({ ...DEFAULT_PARAMS });
@@ -81,6 +85,7 @@ const App: React.FC = () => {
     setDynamicStages(null);
     setDynamicMakespan(null);
     setDynamicFiles(null);
+    setLastRunSeconds(null);
     setActiveTab('params');
   }, []);
 
@@ -92,7 +97,6 @@ const App: React.FC = () => {
     }
     setLoading(true);
     mountedRef.current = true;  // P0-5: 每次新运行时重置标记
-    setLastRunSeconds(null);
     runStartRef.current = Date.now();
 
     const clientToken = crypto.randomUUID();
@@ -108,7 +112,10 @@ const App: React.FC = () => {
       setActiveRunId(res.run_id);
       setDynamicRunning(false);
       setActiveTab('overview');
-      setLastRunSeconds((Date.now() - runStartRef.current) / 1000);
+      setLastRunSeconds(
+        normalizeRunDuration(res.run_duration_s)
+          ?? (Date.now() - runStartRef.current) / 1000,
+      );
       message.success('计算完成！');
     } catch (e: any) {
       if (!mountedRef.current) return;
@@ -149,6 +156,7 @@ const App: React.FC = () => {
     setActiveRunId(runId);
     setDynamicRunning(false);
     setActiveTab('overview');
+    setLastRunSeconds(normalizeRunDuration(data.run_duration_s));
   }, [result]);
 
   const handleReportModeChange = useCallback((mode: any) => {
@@ -304,8 +312,10 @@ const App: React.FC = () => {
               )}
             </Space>
           )}
-          {lastRunSeconds != null && (
-            <Tag color="blue">本次运行耗时 {formatDuration(lastRunSeconds)}</Tag>
+          {result && (
+            <Tag color="blue">
+              本次运行耗时 {lastRunSeconds != null ? formatDuration(lastRunSeconds) : '未记录'}
+            </Tag>
           )}
         </div>
         <Space>

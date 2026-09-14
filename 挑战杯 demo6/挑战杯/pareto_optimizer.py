@@ -273,6 +273,7 @@ def run_quadratic_optimization(
     builder.fifo_load_diff = fifo_baseline_load
     builder.fifo_waiting = fifo_baseline_waiting
 
+    builder._eval_cache.clear()
     opt_schedule, opt_metrics, opt_stages = builder.schedule_from_order(best_order)
     base_schedule, base_metrics, base_stages = builder.schedule_from_order(fifo_order)
 

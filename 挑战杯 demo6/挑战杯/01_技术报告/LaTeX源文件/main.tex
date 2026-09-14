@@ -1,0 +1,626 @@
+\documentclass[UTF8,zihao=-4,openany]{ctexrep}
+
+\usepackage[a4paper,top=2.6cm,bottom=2.6cm,left=2.8cm,right=2.6cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,longtable,tabularx,array,multirow}
+\usepackage{graphicx,float}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{titlesec}
+\usepackage{setspace}
+
+\input{report_data.tex}
+
+\definecolor{steelblue}{HTML}{1F4E79}
+\definecolor{lightsteel}{HTML}{D9EAF7}
+\definecolor{linegray}{HTML}{D9D9D9}
+\definecolor{textgray}{HTML}{555555}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=steelblue,
+  citecolor=steelblue,
+  urlcolor=steelblue,
+  pdfauthor={\ApplicantUnit},
+  pdftitle={船体加工车间智能排产与齐套配盘优化调度技术方案报告}
+}
+
+\setstretch{1.32}
+\setlength{\headheight}{13pt}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.15em}
+\setlist{nosep,leftmargin=2.2em}
+\captionsetup{font=small,labelsep=quad}
+\renewcommand{\arraystretch}{1.22}
+\setlength{\tabcolsep}{5pt}
+
+\titleformat{\chapter}{\centering\bfseries\zihao{2}\color{black}}{第\chinese{chapter}章}{1em}{}
+\titleformat{\section}{\bfseries\zihao{3}\color{black}}{\thesection}{0.8em}{}
+\titleformat{\subsection}{\bfseries\zihao{4}\color{black}}{\thesubsection}{0.8em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small 船体加工车间智能排产与齐套配盘优化调度}
+\fancyhead[R]{\small 技术方案报告}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\important}[1]{\textbf{#1}}
+
+% 最终版举证图片；缺图时由 LaTeX 直接报错，避免占位内容进入提交稿。
+\newcommand{\evidencefigure}[3][0.94\textwidth]{%
+  \begin{figure}[H]
+    \centering
+    \includegraphics[width=#1,height=0.68\textheight,keepaspectratio]{#2}%
+    \caption{#3}
+  \end{figure}
+}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{2.0cm}
+  {\zihao{1}\bfseries 船体加工车间智能排产与齐套配盘优化调度\par}
+  \vspace{0.8cm}
+  {\zihao{2}\bfseries 技术方案报告\par}
+  \vspace{0.6cm}
+  {\zihao{4}\color{steelblue}题目编号 CS-202625\par}
+  \vfill
+  \renewcommand{\arraystretch}{1.5}
+  \begin{tabular}{>{\bfseries}r l}
+    申报单位： & \ApplicantUnit \\
+    申报人： & \ApplicantName \\
+    团队成员： & \TeamMembers \\
+    指导教师： & \AdvisorNames \\
+    联系电话： & \ContactPhone \\
+    报告日期： & \ReportDate \\
+  \end{tabular}
+  \vfill
+  {\small 本报告对应同目录提交的算法源代码、仿真测试程序及实验举证材料。\par}
+\end{titlepage}
+
+\pagenumbering{Roman}
+\chapter*{摘要}
+\addcontentsline{toc}{chapter}{摘要}
+
+本方案针对船体加工车间多品种、小批量、多工序耦合和齐套优先的排产问题，建立覆盖钢板上料、N2/N5双工位切割、桁架分拣、小件自动打磨与坡口、大件人工打磨与坡口、AGV及天车转运、有限缓存和分段齐套的离散事件仿真模型。系统以钢板加工顺序和切割机分配为主要决策，把设备资格、资源互斥、工序前后序、料框分类、缓存容量和齐套门控统一到同一事件时间轴中。
+
+求解层并列提供SA+Tabu、GA+LNS、DQN种子增强NSGA-II和DRL-guided SA等算法接口。正式主实验采用DQN+NSGA-II，在同一Pareto前沿上分别选择产能优先解和兼顾产能、齐套、负载的平衡解；SA+Tabu、GA+LNS和DRL路径保留为对照与快速响应方案。各算法调用同一仿真评价器，以总完工时间、加权平均齐套跨度、切割负载差、等待时间和设备利用率为核心指标。当前数据包含\PlateCount 张钢板、\PartCount 个零件和\KitGroupCount 个分段优先级齐套组。最新代码版本的正式复现实验数值由\code{report\_data.tex}统一维护，避免正文、图表和程序输出出现多套口径。
+
+系统实现FastAPI服务端与React可视化界面，支持附件数据校验、参数配置、排产计算、甘特图、齐套分析、设备利用率、缓存监控、运行历史和设备故障后的剩余任务重排。对于题目未提供的缓存停留、物流和现场容量参数，本方案集中置于\code{ModelConfig}中，并将其标明为待现场校准参数，不作为企业实测结论。
+
+固定随机种子20260723、种群规模16、有效代数10的DQN+NSGA-II实验下，综合交付解将总完工时间由FIFO的65.86小时降至60.09小时，加权平均齐套跨度由15.07小时降至11.79小时，整体产能提高至14.51张/班；产能优先备选解进一步将总完工时间降至58.69小时。两条轨道均未出现死锁警告。坡口工作站峰值仍高于暂定容量，报告将其列为现场参数校准风险。
+
+\noindent\textbf{关键词：}船体加工；智能排产；齐套配盘；离散事件仿真；DQN+NSGA-II；SA+Tabu；GA+LNS；多目标优化；动态重调度；紧急插单
+
+\tableofcontents
+\clearpage
+\pagenumbering{arabic}
+
+\chapter{项目背景与赛题响应}
+
+\section{问题背景}
+
+船体加工车间的交付对象不是单张钢板，而是由多个钢板、不同类型零件和多道工序共同构成的分段齐套集合。若同一分段中少数关键零件延迟，已经完工的其他零件仍需占用料框和缓存区等待，形成在制品积压。与此同时，N2与N5切割机具有不同设备资格和负载状态，下游打磨、坡口、AGV及天车又会反向制约切割顺序。因此，单纯缩短切割时间或采用先到先服务规则，无法同时获得高产能和短齐套周期。该问题属于带异构资源、前后序与有限缓存约束的组合调度问题\cite{pinedo}。
+
+\section{方案贡献}
+
+本方案的核心贡献包括：以小件分段齐套而非单板完工为评价中心；把切割、下游加工、转运与有限缓存置于同一离散事件时间轴；以同一仿真评价器支撑SA+Tabu、GA+LNS、DQN+NSGA-II和DRL-guided SA，避免算法之间评价口径漂移；并在设备故障和订单变更发生后冻结已执行任务，仅对剩余任务重排。系统进一步区分订单变更与紧急插单两种动态模式，支持时间优先、即时停止、多故障并发和原子提交。
+
+\section{赛题要求与本方案对应}
+
+\begin{table}[H]
+\centering
+\caption{赛题要求与系统实现对应关系}
+\begin{tabularx}{\textwidth}{>{\bfseries}p{0.23\textwidth}YY}
+\toprule
+赛题要求 & 本方案实现 & 可验证证据 \\
+\midrule
+多工序和异构设备建模 & 统一建模切割、分拣、打磨、坡口、转运、缓存和齐套事件 & 数学模型、工序事件表、资源利用率 \\
+有限缓存与齐套配盘 & 按分段、优先级、坡口属性、零件类型和来源机台组框，并记录容量占用 & 齐套结果、缓存时序、峰值占用率 \\
+设备负载均衡 & 钢板顺序与N2/N5分配联合评价，负载差进入目标函数 & 双机甘特图、N2/N5利用率 \\
+多目标动态优化 & 同时评价总完工时间、齐套跨度、负载差和等待时间 & FIFO与优化方案对比、Pareto接口 \\
+设备故障和订单扰动 & 冻结已完成/不受影响任务，对剩余任务在故障日历上重排 & 动态重排接口和前端重调度页 \\
+完整仿真系统 & FastAPI后端、React前端、CSV/JSON/PNG导出 & 可运行程序、运行说明和演示截图 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{参考指标与评价口径}
+
+题目给出的参考指标为整体产能13张板/班、总完工时间67.25小时、切割机稼动率61\%和平均齐套时长12.7小时。程序将这些值作为对照口径，同时使用由当前数据自动计算的理论下界进行归一化，避免数据规模变化后仍机械套用固定数值。报告只引用同一代码版本、同一输入和同一随机种子生成的结果。
+
+\chapter{系统总体方案}
+
+\section{程序的实际含义}
+
+该程序本质上是一套\important{面向船体钢板加工的数字化排产实验平台}。它不是生产线控制系统，也不直接驱动PLC；其作用是读取钢板与零件数据，构造候选加工顺序，在离散事件环境中推演每个资源的占用和释放，再由优化算法反复搜索更好的排产方案，最后以甘特图、齐套图和KPI表的形式供计划人员比较。离散事件建模与实验验证遵循仿真建模的一般方法\cite{law}。
+
+\begin{figure}[H]
+\centering
+\fbox{\begin{minipage}{0.92\textwidth}
+\centering
+\textbf{输入数据层}\\
+附件2钢板与零件数据；附件3工艺速度和用时规则\\[0.6em]
+$\Downarrow$\\[0.6em]
+\textbf{模型与仿真层}\\
+数据校验 $\rightarrow$ 工艺时间计算 $\rightarrow$ 资源池与事件队列 $\rightarrow$ 齐套及缓存状态\\[0.6em]
+$\Downarrow$\\[0.6em]
+\textbf{优化求解层}\\
+SA+Tabu；GA+LNS；NSGA-II（可选DQN机器分配种子）\\[0.6em]
+$\Downarrow$\\[0.6em]
+\textbf{服务与展示层}\\
+FastAPI接口 $\rightarrow$ React页面 $\rightarrow$ CSV、JSON、PNG和Word导出
+\end{minipage}}
+\caption{系统数据流和功能分层}
+\end{figure}
+
+\section{软件结构}
+
+\small
+\begin{longtable}{p{0.36\textwidth}p{0.56\textwidth}}
+\caption{核心代码模块}\label{tab:code-map}\\
+\toprule
+文件或目录 & 职责 \\
+\midrule
+\endfirsthead
+\toprule
+文件或目录 & 职责 \\
+\midrule
+\endhead
+\code{steel\_schedule\_model.py} & 数据校验、工艺参数、资源池、离散事件仿真、KPI和图表输出 \\
+\code{improved\_optimizer.py} & SA+Tabu、多初始策略、邻域搜索、缓存评价和并行入口 \\
+\code{ga\_lns\_optimizer.py} & 遗传编码、交叉变异、破坏修复和档案维护 \\
+\code{dqn\_machine\_model.py} & DQN机器分配网络、特征域检查、权重加载和启发式回退 \\
+\code{dqn\_nsga2\_optimizer.py} & 钢板顺序与机器码联合编码、非支配排序和拥挤度筛选 \\
+\code{drl\_optimizer.py} & 轻量Q-learning算子选择实验模块 \\
+\code{backend/main.py} & 数据上传、运行管理、结果读取、报告导出、重调度和鲁棒性接口 \\
+\code{frontend/src} & 参数配置、结果概览、甘特图、齐套分析、利用率和缓存监控 \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{输入输出}
+
+附件2包含钢板表和零件表。程序检查主键重复、钢板与零件关联、零件数量、小件/大件数量和V坡长度汇总关系，并保留打磨长度缺失清单。附件3提供厚度相关的直切、V\&Y坡和X\&K坡速度，非精确厚度使用线性插值。
+
+每次完整运行输出钢板排程、零件完成时刻、齐套组、工序事件、方案对比、缓存时序和汇总指标。Web端将这些数据转换为计划员可直接查看的图表和历史记录。
+
+\chapter{生产过程与建模假设}
+
+\section{资源边界}
+
+当前正式场景固定为1台人工天车、N2/N5两台双工位切割机、2套双臂分拣桁架、2套小件自由边打磨设备、1台自动小件坡口设备、1个人工坡口工位和2台AGV。N5仅接收板厚不超过36\,mm且板宽不超过4500\,mm的钢板；不满足资格条件的钢板必须分配至N2。
+
+\section{工艺路线}
+
+小件在切割后经过桁架分拣、自动打磨、按坡口属性分流、码垛和AGV转运。坡口件还需进入自动坡口工位；当同一分段的相关优先级组满足到齐条件后，料框由AGV转入齐套区。大件经过胎架自由边打磨，需坡口时由天车运至人工坡口工位，随后进入成品放置区，不进入小件分段齐套门控。
+
+\section{料框与齐套定义}
+
+小件料框键定义为
+\begin{equation}
+ b(i)=\bigl(s_i,q_i,e_i,t_i,m_i\bigr),
+\end{equation}
+其中$s_i$为分段号，$q_i$为齐套优先级，$e_i$表示是否需要坡口，$t_i$为零件类型，$m_i$为来源切割机。坡口件与非坡口件不混装。分段齐套只针对小件料框；程序首先判断各小件优先级组是否到齐，再按分段执行最终齐套转运。大件加工完成后进入成品放置区，不参与小件分段齐套门控。
+
+组$g$的齐套跨度定义为
+\begin{equation}
+ K_g=\max_{i\in I_g}a_i-\min_{i\in I_g}a_i,
+\end{equation}
+其中$a_i$为零件到达中间缓存或坡口工作站的时间。加权平均齐套跨度为
+\begin{equation}
+ \bar K=\frac{\sum_{g\in G}|I_g|K_g}{\sum_{g\in G}|I_g|}.
+\end{equation}
+
+\section{参数边界}
+
+凡题目未给出的AGV单次运输时间、齐套区停留时间、部分缓存容量和空车返回系数，均集中在\code{ModelConfig}中。正式答辩时必须把这些参数称为“模型参数”或“待现场校准参数”，不能称为企业实测值。
+
+\chapter{数学模型}
+
+\section{集合和参数}
+
+设$P$为钢板集合，$I$为零件集合，$M=\{\mathrm{N2},\mathrm{N5}\}$为切割机集合，$R$为下游资源集合，$G$为齐套组集合，$H$为缓存集合。$I_p$表示钢板$p$上的零件，$I_g$表示齐套组$g$包含的零件。$d_p^{\mathrm{cut}}$为钢板切割工时，$d_{ir}$为零件$i$在资源$r$上的加工时间，$B_h$为缓存$h$的容量。
+
+\section{切割时间}
+
+程序采用附件3的厚度相关速度表。分项切割时间为
+\begin{equation}
+ d_p^{\mathrm{cut}}=
+ \frac{L_p^{\mathrm{straight}}}{v^{\mathrm{straight}}(\theta_p)}
+ +\frac{L_p^{V}}{v^{VY}(\theta_p)}
+ +\frac{L_p^{\mathrm{empty}}}{v^{\mathrm{rapid}}}
+ +\frac{L_p^{\mathrm{mark}}}{v^{\mathrm{mark}}}
+ +t^{\mathrm{setup}}.
+\end{equation}
+当前模型采用分项明细公式，不再使用附件3中除以$0.8\times0.6$的打包系数，避免与空行程、划线和换板准备重复计算。当前配置中穿孔时间已折算，残材换料与另一工位加工并行，因此不把每张钢板的残材时间串行加入切割节拍；上料准备时间按$t^{\mathrm{setup}}$显式计入。
+
+\section{决策变量}
+
+用$x_{pm}\in\{0,1\}$表示钢板$p$是否分配给切割机$m$，用排列$\pi=(p_1,p_2,\ldots,p_{|P|})$表示钢板加工顺序。$S_{ir}$和$C_{ir}$分别表示任务$i$在资源$r$上的开始和完成时刻。基本分配约束为
+\begin{equation}
+ \sum_{m\in M}x_{pm}=1,\qquad \forall p\in P,
+\end{equation}
+并对N5资格不满足的钢板强制$x_{p,\mathrm{N5}}=0$。
+
+\section{工序和资源约束}
+
+对零件$i$的相邻工序$k$与$k+1$，有
+\begin{equation}
+ S_{i,k+1}\ge C_{ik}+\tau_{i,k\rightarrow k+1},
+\end{equation}
+其中$\tau$为必要转运时间。同一资源上的任意两个任务$a,b$必须满足析取约束
+\begin{equation}
+ C_{ar}\le S_{br}\quad\text{或}\quad C_{br}\le S_{ar}.
+\end{equation}
+资源故障区间记为$\Omega_r$，任务占用区间不得与$\Omega_r$相交。缓存占用写为
+\begin{equation}
+ 0\le Q_h(t)\le B_h,\qquad h\in H.\label{eq:buffer-capacity}
+\end{equation}
+机旁码垛区和齐套缓存采用事件延迟门控；半框缓存、坡口缓存和坡口工作站通过峰值占用率参与可行性评价。任一容量超限或死锁候选解都会被施加高额惩罚，并在最终选解阶段优先排除，从而保证正式输出方案满足式~\eqref{eq:buffer-capacity}的容量边界。
+
+资源池采用最早就绪递推。设任务$i$在资源$r$上的到达时刻为$R_{ir}$，资源$r$的上一任务释放时刻为$F_r$，资源可用日历给出的最早可用时刻为$A_r$，则
+\begin{equation}
+ S_{ir}=\max\{R_{ir},F_r,A_r\},\qquad C_{ir}=S_{ir}+d_{ir}.
+\end{equation}
+
+理论下界由切割资源、下游资源负荷和单板关键链三者共同确定：
+\begin{equation}
+ LB_{\mathrm{cut}}=\frac{\sum_{p\in P}d_p^{\mathrm{cut}}}{|M|},
+ \quad
+ LB_{\mathrm{down}}=\max_{r\in R}\frac{\sum_{i\in I}d_{ir}}{n_r},
+ \quad
+ LB_{\mathrm{chain}}=\max_{p\in P}C_p^{\mathrm{key}},
+\end{equation}
+\begin{equation}
+ LB=\max\{LB_{\mathrm{cut}},LB_{\mathrm{down}},LB_{\mathrm{chain}}\}.
+\end{equation}
+
+班次产能、切割机综合稼动率和等待时间分别写为
+\begin{equation}
+ THR=\frac{8N_{\mathrm{plate}}}{C_{\max}},
+ \qquad
+ OEE_{\mathrm{cut}}=\frac{\sum_{m\in M}L_m}{|M|C_{\max}},
+\end{equation}
+\begin{equation}
+ W_{\mathrm{total}}
+ =\sum_{p\in P}\max\{0,S_p^{\mathrm{cut}}-C_p^{\mathrm{raw}}\}
+ +\sum_{i\in I_S}\max\{0,C_{g(i)}^{\mathrm{kit}}-a_i^{\mathrm{half}}\},
+\end{equation}
+其中$I_S$为进入小件料框链路的小件集合，$C_{g(i)}^{\mathrm{kit}}$为小件组$g(i)$完成齐套的时刻，$a_i^{\mathrm{half}}$为零件到达半框缓存的时刻。
+
+\section{优化目标}
+
+总完工时间为
+\begin{equation}
+ C_{\max}=\max\left\{\max_{g\in G}C_g^{\mathrm{kit}},\ \max_{i\in I_{\mathrm{large}}}C_i\right\}.
+\end{equation}
+切割负载差为
+\begin{equation}
+ D_{\mathrm{load}}=\max_{m\in M}\sum_{p\in P}x_{pm}d_p^{\mathrm{cut}}
+ -\min_{m\in M}\sum_{p\in P}x_{pm}d_p^{\mathrm{cut}}.
+\end{equation}
+当前主路径采用产能优先的有界辅助目标
+\begin{equation}
+ J=\frac{C_{\max}}{LB}+\varepsilon
+ \left(w_K n_K+w_L n_L+w_W n_W\right),
+\end{equation}
+其中$LB$为理论下界，$n_K,n_L,n_W\in[0,1]$分别为齐套跨度、负载差和等待时间的归一化量。$\varepsilon$限制辅助指标对产能目标的扰动范围。
+
+NSGA-II接口直接使用四维目标向量
+\begin{equation}
+ \bm f=\left(\frac{C_{\max}}{LB},\frac{\bar K}{\bar K_{\mathrm{FIFO}}},
+ \frac{D_{\mathrm{load}}}{D_{\mathrm{FIFO}}},\frac{W}{W_{\mathrm{FIFO}}}\right).
+\end{equation}
+
+为适应不同计划口径，程序还保留简单固定权重、FIFO相对平衡、二次非线性和DRL动态权重等评价函数。简单固定权重形式为
+\begin{equation}
+ J_{\mathrm{simple}}
+ =0.4\frac{C_{\max}}{C_{\max}^{ref}}
+ +0.4\frac{\bar K}{\bar K^{ref}}
+ +0.2\frac{D_{\mathrm{load}}}{D_{\mathrm{load}}^{ref}}
+ +\lambda_{\mathrm{idle}}I_{\mathrm{idle}},
+\end{equation}
+其中$D_{\mathrm{load}}^{ref}$为可配置负载参考值，不作为赛题硬性阈值。产能优先标量函数和有界辅助项为
+\begin{equation}
+ n_K=\min\left(1,\frac{\bar K}{\bar K_{\mathrm{FIFO}}}\right),\quad
+ n_L=\min\left(1,\frac{D_{\mathrm{load}}}{D_{\mathrm{FIFO}}}\right),\quad
+ n_W=\min\left(1,\frac{W}{W_{\mathrm{FIFO}}}\right),
+\end{equation}
+\begin{equation}
+ J_{\mathrm{cap}}=\frac{C_{\max}}{LB}
+ +\varepsilon\left(w_Kn_K+w_Ln_L+w_Wn_W\right).
+\end{equation}
+当评价类型为二次非线性时，辅助项采用$n_K^2,n_L^2,n_W^2$。FIFO相对线性平衡函数为
+\begin{equation}
+ J_{\mathrm{bal}}
+ =w_C\frac{C_{\max}}{C_{\max}^{\mathrm{FIFO}}}
+ +w_K\frac{\bar K}{\bar K^{\mathrm{FIFO}}}
+ +w_L\frac{D_{\mathrm{load}}}{D_{\mathrm{load}}^{\mathrm{FIFO}}}.
+\end{equation}
+
+动态重排使用未完成钢板的切割完工、优先级和负载标准差构造在线目标：
+\begin{equation}
+ J_{\mathrm{dyn}}
+ =C_{\mathrm{cut}}
+ +0.002\sum_{p\in P_R}(11-pri_p)c_p
+ +0.05\sigma_{\mathrm{load}},
+\end{equation}
+其中$P_R$为剩余钢板集合，$pri_p$为齐套优先级，$c_p$为钢板完成时刻。
+
+\chapter{优化算法设计}
+
+\section{SA与Tabu混合搜索}
+
+SA+Tabu用于中等规模数据、计算时间受限或需要快速得到稳定单解的场景。系统以FIFO、分段优先、短工时优先、长工时优先和天车感知等规则构造多个初始解，避免搜索完全依赖单一排序。钢板排列是主要搜索对象，每个邻域动作都会调用同一离散事件仿真器得到总完工时间、齐套跨度、负载差和等待指标。
+
+搜索过程交替使用交换、插入、分块逆序、分段洗牌、分段聚类、齐套聚类、天车错峰和跨机负载修复等邻域。候选解变好时直接接受，变差时按模拟退火概率接受：
+\begin{equation}
+ P(\text{accept})=\min\left(1,\exp\left[-\frac{J'-J}{T}\right]\right)
+\end{equation}
+其中$J$和$J'$分别为当前解和候选解的目标值，$T$为当前温度。降温过程中接受差解的概率逐渐降低；连续多次无改善时执行回热，以逃离局部最优。Tabu表记录近期完整钢板序列的哈希，降低重复搜索概率\cite{sa,tabu}。算法同时维护Pareto档案，完成搜索后按产能优先或三指标平衡口径选解。
+
+\section{GA与LNS}
+
+GA+LNS适合分段数量较多、同分段钢板需要成簇、单纯局部邻域容易陷入局部最优的离线排产。GA层以钢板排列为染色体，使用锦标赛选择、OX或PMX顺序交叉以及交换、插入等变异，保证子代仍为完整且不重复的钢板排列。
+
+LNS层在遗传搜索中增加破坏—修复机制。破坏算子按随机、分段或瓶颈特征移除一部分钢板，修复算子根据齐套优先级、切割工时和当前机器负载重新插入。该机制可以跨越原有片段重构整体顺序，适合扩大全局搜索范围。GA+LNS同样维护Pareto档案，并共享离散事件仿真器，因此其结果可以与SA+Tabu和DQN+NSGA-II直接比较。
+
+\section{DQN种子与NSGA-II}
+
+DQN+NSGA-II是当前正式主算法，适用于钢板顺序和N2/N5机器分配需要联合优化、且计划人员希望一次看到多种目标取舍的场景。DQN模块按16维状态输入，经$16\rightarrow128\rightarrow64\rightarrow5$网络输出固定动作维，正式场景中仅使用N2/N5对应的合法动作。状态包含板厚、板宽、切割工时、齐套优先级、机器负载和剩余任务量。
+
+DQN只用于生成少量高质量机器码，不替代完整排产仿真。当PyTorch、权重文件、特征范围检查不通过或训练数据分布不匹配时，系统自动回退到负载均衡、N2偏好、N5偏好和随机扰动组成的启发式机器码。
+
+NSGA-II联合演化钢板顺序$OS$和机器码$MS$，使用非支配排序、拥挤距离和概率精英保留维护多样性。每个个体均运行完整离散事件仿真，并以总完工时间、平均齐套跨度、切割负载差和等待时间构成四维目标向量。一次搜索输出Pareto前沿，再从前沿中分别选择产能优先解和综合交付解。该算法适合多部门讨论，不把多个目标提前压缩成固定权重。
+
+\section{DRL-guided SA与多进程加速}
+
+DRL-guided SA用于数据规模有限、但希望算法在搜索过程中自动调整邻域和权重的场景。该模块把搜索阶段、温度区间、连续未改善次数、齐套趋势和负载等级离散为状态，由Q-learning在多个邻域算子和三组目标权重之间选择动作。经验回放和$\varepsilon$-greedy策略用于更新Q表，搜索前期偏向探索，后期偏向精细调整。
+
+候选解之间相互独立，因此系统支持多进程加速。DQN+NSGA-II和GA+LNS在主进程生成种群，再通过进程池并行运行完整仿真；SA+Tabu、二次SA和DRL-guided SA按初始策略分配工作进程。Windows使用spawn，类Unix系统使用fork。普通算法两条交付轨道各分一半CPU，DQN+NSGA-II只执行一次Pareto搜索，可使用全部可用核心。设置\code{parallel\_workers=1}或\code{OPTIMIZER\_PARALLEL=0}可退回串行模式，便于严格复现。
+
+\section{算法选择原则}
+
+算法选择不应只依据算法名称，而应由数据规模、优化目标、可用计算时间、是否需要多解以及现场响应方式共同决定。单解快速交付优先选择SA+Tabu；需要扩大搜索范围时使用GA+LNS；需要同时比较产能、齐套、负载和等待时使用DQN+NSGA-II；数据有限但希望自动调参时使用DRL-guided SA；故障和订单扰动则使用动态修复路径。
+
+\begin{table}[H]
+\centering
+\caption{算法适用边界与选型矩阵}
+\small
+\begin{tabularx}{\textwidth}{p{0.17\textwidth}p{0.12\textwidth}p{0.13\textwidth}p{0.15\textwidth}YY}
+\toprule
+算法 & 适用规模 & 响应预算 & 输出形态 & 主要优势 & 主要限制与适用边界 \\
+\midrule
+SA+Tabu & 中等 & 秒至分钟 & 单解或小型档案 & 邻域清晰、响应稳定、对初值依赖较低 & 需要设置初温和迭代预算，主要优化钢板顺序 \\
+GA+LNS & 中等至较大 & 分钟至上十分钟 & 单解或双目标档案 & 交叉和破坏修复可跨区域搜索，种群多样性强 & 评估次数较多，不适合很短响应窗口 \\
+DQN+NSGA-II & 中等至较大 & 分钟级 & 四目标Pareto前沿 & 机器分配与钢板顺序联合优化，可一次输出多套方案 & 需要种群和代数预算，DQN权重需检查适用范围 \\
+DRL-guided SA & 小至中等 & 秒至分钟 & 自适应单解 & 能根据搜索阶段自动选择算子和权重 & 依赖Q表训练质量，不如Pareto前沿直观 \\
+构造式规则 & 任意 & 秒级 & 单个基线解 & 计算量最低，结果稳定，适合应急和接口验证 & 优化空间有限，通常作为初始解或对照基线 \\
+动态修复路径 & 受扰动任务规模 & 秒级至分钟级 & 修复后单解或Pareto解 & 保留已执行任务，可处理故障、变更和插单 & 必须先建立状态快照，大范围变更仍需全局仿真 \\
+\bottomrule
+\end{tabularx}
+\vspace{0.5em}
+\begin{minipage}{0.96\textwidth}
+\small
+\textbf{注：}\par
+1. DRL-guided SA不是用户直接选择的算法。当用户选择SA+Tabu、线性评价、产能优先轨道且局部搜索迭代次数不少于400时，系统自动启用DRL-guided SA；其他算法、二次评价轨道和三指标平衡轨道仍使用各自既定求解路径。\par
+
+2. 构造式规则同样不作为独立算法入口，而是用于FIFO基线、SA+Tabu和GA+LNS的初始种群、DQN+NSGA-II的初始顺序、DQN失效回退以及快速可行排程。\par
+
+3. 所有求解器均支持多进程加速。候选个体或初始策略可以在不同进程中并行评估，Windows使用spawn，类Unix系统使用fork；设置\code{parallel\_workers=1}或\code{OPTIMIZER\_PARALLEL=0}可切换为串行模式以复现实验结果。
+\end{minipage}
+\end{table}
+
+\chapter{离散事件仿真与动态响应}
+
+\section{状态模型}
+
+仿真状态包含切割头和双工位释放时间、下游资源池、天车时序、AGV位置与区域释放时间、料框组成、缓存进入/离开事件、齐套组到达状态和故障日历。事件以时间和稳定序号排序，保证同一输入和同一随机种子下结果可追踪。
+
+\section{事件推进}
+
+仿真按以下顺序推进：数据校验；钢板上料和双工位切割；小件与大件分流；分拣、打磨及坡口加工；料框聚合和转运；齐套条件判断；最终齐套转运；KPI与文件输出。与只统计总工时的静态模型相比，该过程能够显式发现资源等待、物流冲突和缓存压力。
+
+\section{设备故障重排}
+
+当前接口支持机器故障、已有钢板优先级调整、订单取消、订单变更和紧急插单。设备故障可以覆盖切割头、胎架、配套打磨机、坡口设备、AGV和天车，并允许多个故障重叠、提前修复或调整修复结束时间。系统在决策时刻冻结已完成钢板，将故障区间映射到资源日历，把在制钢板按“继续加工”或“中断清台”策略处理，再对剩余钢板执行稳定右移、局部窗口重排或全局重排。
+
+附件2上传并校验成功后显示“订单变更”和“紧急插单”。订单变更使用新附件2作为变更后的订单数据，沿用原动态重排逻辑，不拆分新增批次和原计划批次。紧急插单把新附件2作为新增批次，原计划保留：先计算新增批次前4张钢板并生成staging预览，再在后台完成全部新增钢板；新增批次排完后以其资源释放时间为起点续排原计划剩余钢板。若新增批次与原计划存在同名钢板，系统直接提示重名，不合并不同订单。
+
+用户可设置最大计算时间和“时间优先模式”。时间优先时系统自动放大迭代次数、种群规模或代数上限，使搜索尽量使用约95\%的时间预算；关闭后完全按模型参数运行。任何模式都支持紧急中断：停止后台搜索，删除对应staging，不提交current，不更新history.json，并恢复动态响应前的正式结果。
+
+\chapter{仿真实验设计与结果}
+
+\section{实验环境}
+
+\begin{table}[H]
+\centering
+\caption{复现实验环境}
+\begin{tabularx}{\textwidth}{p{0.25\textwidth}Y}
+\toprule
+项目 & 配置 \\
+\midrule
+操作系统 & Windows 11，10.0.26200 \\
+Python & 3.12.14，64位 \\
+前端 & React、TypeScript、Vite、Ant Design、ECharts \\
+后端 & FastAPI、pandas 3.0.1、NumPy 2.3.5、openpyxl、Pillow、python-docx \\
+输入 & 附件2钢板零件数据、附件3工艺用时计算表 \\
+随机种子 & 20260723 \\
+主验证算法 & DQN+NSGA-II，种群16，有效代数10，单进程复现 \\
+运行时间 & 96.59秒（本轮单进程正式运行） \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{数据校验}
+
+官方数据共包含\PlateCount 张钢板和\PartCount 个零件，形成\KitGroupCount 个“分段+优先级”齐套组。钢板与零件关联、零件数量、小件/大件数量和V坡汇总检查均通过。原始数据中有2个零件缺少打磨长度，程序将其记为数据告警并按0参与本次仿真；该处理仅用于保证赛题数据可计算，不代表现场确认值。
+
+\section{主实验结果}
+
+\begin{table}[H]
+\centering
+\caption{FIFO基线与当前版本两条优化轨道结果}
+\small
+\begin{tabularx}{\textwidth}{Ycccc}
+\toprule
+指标 & FIFO基线 & 产能优先 & 三指标平衡 & 赛题参考值 \\
+\midrule
+总完工时间（h） & \BaseCmax & \OptCmax & \BalancedCmax & 67.25 \\
+加权平均齐套跨度（h） & \BaseKitSpan & \OptKitSpan & \BalancedKitSpan & 12.7 \\
+切割负载差（h） & \BaseLoadDiff & \OptLoadDiff & \BalancedLoadDiff & -- \\
+整体产能（张板/班） & \BaseThroughput & \OptThroughput & \BalancedThroughput & 13 \\
+切割机综合稼动率 & \BaseCutUtil\% & \OptCutUtil\% & \BalancedCutUtil\% & 61\% \\
+坡口工作站峰值占用率 & \BaseBevelWorkstationPeak\% & \OptBevelWorkstationPeak\% & \BalancedBevelWorkstationPeak\% & 待现场校准 \\
+死锁警告数 & -- & \DeadlockCount & \DeadlockCount & 0 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+本表的数值只从当前代码版本复现实验读取。相较FIFO，综合交付解将总完工时间缩短约8.76\%，平均齐套跨度缩短约21.75\%，整体产能提高约9.60\%；产能优先备选解将总完工时间缩短约10.89\%，整体产能提高约12.22\%，但平均齐套跨度为14.52小时。综合交付解取得60.09小时总完工时间、11.79小时平均齐套跨度和14.51张板/班产能，满足产能和齐套参考要求。坡口工作站峰值占用率高于当前暂定容量，说明该容量参数尚未由现场数据校准，不能把超过100\%的结果解释为现场容量已经满足。若后续更换参数或修改约束，必须重新生成全部指标与图片，不能将不同运行的最优值拼接成一组结果。
+
+\evidencefigure{assets/cutting_gantt.png}{当前版本优化排程的N2/N5切割甘特图}
+\evidencefigure{assets/kit_span.png}{各分段优先级组的齐套跨度}
+\evidencefigure{assets/resource_utilisation.png}{下游资源利用率}
+
+\section{Web系统举证材料}
+
+以下静态页面截图取自同一组正式运行，保留了当前输入、算法轨道、运行记录和主要指标；动态重调度截图以该排程为基础注入N5故障。它们依次证明数据与参数可配置、排程结果可解释、资源与齐套状态可追踪，以及异常发生后能够在线重排。
+
+\evidencefigure{assets/ui_data_upload.png}{附件2与附件3数据上传界面}
+\evidencefigure{assets/ui_parameter_config.png}{优化算法、评价函数与目标权重配置}
+\evidencefigure{assets/ui_result_overview.png}{FIFO基线与齐套感知优化方案关键指标对比}
+\evidencefigure{assets/ui_gantt.png}{全资源排产甘特图与工序时间轴}
+\evidencefigure{assets/ui_kit_analysis.png}{各齐套组首件到达至齐套完成区间}
+\evidencefigure{assets/ui_kit_dashboard.png}{齐套配盘看板、瓶颈分段与分段进度}
+\evidencefigure{assets/ui_resource_utilization.png}{设备资源利用率统计}
+\evidencefigure{assets/ui_buffer_monitor.png}{四级缓存时序、容量阈值与溢出状态监控}
+\evidencefigure{assets/current_dynamic_response.png}{N2故障叠加订单变更后的动态重排结果}
+
+\section{动态实验设计}
+
+正式举证采用\DynamicFaultResource 在\DynamicFaultStart 发生、持续\DynamicFaultDuration 的故障，并叠加取消1张未投料钢板和调整1张未投料钢板优先级的订单变更。系统冻结\DynamicFrozenPlates 张已完成钢板，对其余\DynamicReoptimizedPlates 张钢板重新优化，取消\DynamicCancelledPlates 张钢板；本次重排响应时间为\DynamicResponseSeconds 秒，新总完工时间为\DynamicCmax 小时，加权齐套跨度为\DynamicKitSpan 小时，整体产能为\DynamicThroughput 张/班，切割机综合稼动率为\DynamicCutUtil\%。截图中的故障参数、响应时间和重排后KPI来自同一次运行，可据此复核动态重调度链路。
+
+\chapter{工程实现与复现方法}
+
+\section{启动方法}
+
+在Windows环境下可双击\code{start.bat}启动。脚本完成依赖检查、前端构建和FastAPI服务启动后，浏览器访问\url{http://127.0.0.1:8000}。命令行基础模型可按以下方式运行：
+
+\begin{verbatim}
+python steel_schedule_model.py \
+  --input "附件2：钢板零件数据.xlsx" \
+  --speed-table "附件3：工艺用时计算表.xlsx" \
+  --output outputs
+\end{verbatim}
+
+\section{操作流程}
+
+\begin{enumerate}
+  \item 上传附件2，并按需上传附件3；确认数据校验全部通过。
+  \item 保持N2/N5、资源数量和缓存容量与正式实验配置一致。
+  \item 选择算法、评价函数、迭代预算和随机种子后开始计算。
+  \item 查看结果概览、甘特图、齐套分析、设备利用率和缓存监控。
+  \item 导出CSV、PNG和运行报告，并记录运行ID及参数。
+  \item 在重调度页配置故障机台、故障时刻和持续时间，执行动态验证。
+\end{enumerate}
+
+\section{可复现性控制}
+
+本提交包固定附件2、附件3、随机种子20260723、DQN+NSGA-II种群规模16、有效代数10和单进程评估配置，并保存产能优先轨道与综合交付轨道的\code{summary.json}、CSV与PNG。所有正文指标均由这两份汇总文件生成。时间优先模式开启时，系统把最大计算时间的约95\%作为优化预算；关闭时完全按模型参数运行。复现时应保持上述配置一致；如修改模型约束或参数，应把新结果保存到独立目录并同步更新报告数据，避免跨版本拼接指标。
+
+\chapter{工程边界与交付结论}
+
+\section{能力边界与验证状态}
+
+\begin{longtable}{p{0.22\textwidth}p{0.34\textwidth}p{0.34\textwidth}}
+\caption{系统能力边界与验证证据}\label{tab:delivery-boundary}\\
+\toprule
+能力项 & 本次交付口径 & 验证证据 \\
+\midrule
+\endfirsthead
+\toprule
+能力项 & 本次交付口径 & 验证证据 \\
+\midrule
+\endhead
+静态智能排产 & 联合决定109张钢板的加工顺序与N2/N5分配，并推进完整下游工序 & 固定种子汇总文件、排程CSV、甘特图与FIFO对比 \\
+齐套配盘优化 & 以“分段+优先级”组为齐套单元，评价加权平均与最大齐套跨度 & 齐套组CSV、齐套跨度图和齐套看板 \\
+有限缓存约束 & 机旁码垛与齐套缓存采用事件门控，其余缓存进入可行性评价 & 缓存时序、峰值占用率和0项死锁告警 \\
+动态重调度 & 支持多故障、订单变更、紧急插单、在制处置、时间优先和即时中断 & N2故障叠加订单变更、7.74秒响应、冻结16张和重排92张记录 \\
+算法交付 & DQN+NSGA-II为正式复现主路径；SA+Tabu、GA+LNS和DRL作为对照或快速响应路径 & 统一仿真评价接口、Pareto前沿和源代码 \\
+系统定位 & 面向计划员的排产决策与仿真验证平台，不直接控制PLC或替代MES & FastAPI接口、React界面、导出文件和运行说明 \\
+数据边界 & 两个缺失打磨长度按0处理并显式告警；未知现场参数集中配置 & 数据校验摘要与\code{ModelConfig}参数表 \\
+\bottomrule
+\end{longtable}
+
+\section{技术创新与应用价值}
+
+\begin{enumerate}
+  \item \textbf{齐套目标前置。} 将分段齐套跨度直接纳入排产评价，使优化对象从“单张钢板尽快完成”扩展为“下游装配所需零件尽早成套”。
+  \item \textbf{生产物流一体化仿真。} 在同一事件时间轴内表达切割、分拣、打磨、坡口、AGV、天车和缓存，能够解释局部加速为何可能转化为下游拥堵。
+  \item \textbf{可行性优先的多算法优化。} SA+Tabu、GA+LNS、DQN+NSGA-II和DRL-guided SA共享同一仿真评价器，容量超限与死锁解被统一惩罚；同一Pareto前沿可输出产能优先解和综合交付解。
+  \item \textbf{面向扰动和插单的滚动重排。} 故障发生后保留已执行决策，仅优化受影响的剩余任务；订单变更不拆批次，紧急插单将新增批次前置并在完成后续排原计划，在控制计划波动的同时给出秒级响应和新的KPI结果。
+\end{enumerate}
+
+\section{结论}
+
+本方案已形成从附件数据校验、工艺时间计算、钢板排序与机器分配，到全链路离散事件仿真、小件齐套判断、有限缓存监控、KPI导出、设备故障重排和订单变更/紧急插单处理的完整闭环。综合交付解相较FIFO将总完工时间降低8.76\%、平均齐套跨度降低21.75\%、整体产能提高9.60\%；产能优先备选解将总完工时间进一步降至58.69小时。最终交付物包括技术报告、LaTeX源文件、算法与仿真程序、官方输入以及可复核的JSON、CSV、PNG和Web截图，能够支持现场演示、结果追溯与后续参数校准。
+
+\appendix
+\chapter{主要参数表}
+
+\begin{longtable}{p{0.32\textwidth}p{0.20\textwidth}p{0.38\textwidth}}
+\toprule
+参数 & 当前值 & 来源或说明 \\
+\midrule
+直切速度 & 按厚度查表 & 附件3；无表时回退1700\,mm/min \\
+V\&Y坡速度 & 按厚度查表 & 附件3；线性插值 \\
+空行程/划线速度 & 24000\,mm/min & 题目工艺说明 \\
+小件打磨速度 & 2520\,mm/min & 42\,mm/s \\
+大件打磨速度 & 1950\,mm/min & 1.95\,m/min \\
+人工坡口速度 & 250\,mm/min & 题目工艺说明 \\
+N2/N5码垛容量 & 10/18框 & 题目给定 \\
+坡口缓存 & 3框 & 题目给定 \\
+半框缓存 & 14框 & 模型参数，待现场确认 \\
+齐套缓存 & 16框 & 模型参数，待现场确认 \\
+齐套停留时间 & 60\,min & 模型参数，待现场确认 \\
+\bottomrule
+\end{longtable}
+
+\chapter{提交材料对应关系}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{p{0.28\textwidth}Y}
+\toprule
+提交物 & 提交包位置 \\
+\midrule
+技术报告与LaTeX源文件 & \code{01\_技术报告} \\
+算法源代码与仿真程序 & \code{02\_算法与仿真程序} \\
+赛题文件及附件2/3 & \code{03\_赛题与输入数据} \\
+固定实验结果 & \code{04\_仿真实验举证材料/01--02} \\
+Web系统截图 & \code{04\_仿真实验举证材料/03\_Web系统截图} \\
+运行与提交说明 & 提交包根目录\code{README\_提交说明.md} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{thebibliography}{9}
+\bibitem{pinedo} M. Pinedo. \textit{Scheduling: Theory, Algorithms, and Systems}. Springer.
+\bibitem{law} A. M. Law. \textit{Simulation Modeling and Analysis}. McGraw-Hill.
+\bibitem{sa} S. Kirkpatrick, C. Gelatt, M. Vecchi. Optimization by Simulated Annealing. \textit{Science}, 1983.
+\bibitem{tabu} F. Glover. Tabu Search. \textit{ORSA Journal on Computing}, 1989.
+\bibitem{nsga2} K. Deb et al. A Fast and Elitist Multiobjective Genetic Algorithm: NSGA-II. \textit{IEEE Transactions on Evolutionary Computation}, 2002.
+\bibitem{dqn} V. Mnih et al. Human-level Control through Deep Reinforcement Learning. \textit{Nature}, 2015.
+\end{thebibliography}
+
+\end{document}

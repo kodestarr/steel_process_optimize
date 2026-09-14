@@ -128,6 +128,7 @@ export interface ComparisonRow {
 
 export interface RunResponse {
   run_id: string;
+  run_duration_s?: number | null;
   reportMode?: 'capacity' | 'balanced';
   algorithmName?: string;
   metrics: {
@@ -175,6 +176,7 @@ export interface HistoryItem {
   base_metrics?: MetricsMap;
   score?: number;
   algorithm_name?: string;
+  run_duration_s?: number | null;
   optimized_metrics: MetricsMap;
 }
 
